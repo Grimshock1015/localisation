@@ -87,6 +87,26 @@ void reset_sensor_color_filter(void);
 #ifndef COLOUR_SENSOR_PORT
 #define COLOUR_SENSOR_PORT PORT_3
 #endif
+#ifndef GYRO_SENSOR_PORT
+#define GYRO_SENSOR_PORT PORT_2
+#endif
+
+typedef enum {STOP_ERROR=-1, STOP_TIMEOUT=0, STOP_DISTANCE=1, STOP_COLOUR=2, STOP_ANGLE=3} StopReason;
+
+typedef struct
+{
+ StopReason reason;
+ int colour;     // Map colour ID that ended the move; only meaningful when reason==STOP_COLOUR.
+} MoveResult;
+
+// Stop colours are map IDs 1..6 (black, blue, green, yellow, red, white); max_revolutions<=0 or timeout_ms<=0 means "no limit" but at least one is required.
+MoveResult move_forward_until(const int *stop_colours, int colour_count, double max_revolutions, int timeout_ms);
+MoveResult move_backward_until(const int *stop_colours, int colour_count, double max_revolutions, int timeout_ms);
+// turn_direction: 0=right, 1=left. Colours/timeout are optional; without them the pivot ends when the angle is reached.
+MoveResult pivot_single_wheel(int angle_degrees, int turn_direction, int reverse, const int *stop_colours, int colour_count, int timeout_ms);
+MoveResult turn_in_place(int angle_degrees, int turn_direction, int timeout_ms);
+MoveResult turn_in_place_until(int angle_degrees, int turn_direction, const int *stop_colours, int colour_count, int timeout_ms);
+int report_move_result(const char *label, MoveResult result);
 int beep(void);
 unsigned char *readPPMimage(const char *filename, int *rx, int*ry);
 

@@ -87,8 +87,10 @@
 */
 
 #include "EV3_Localization.h"
+#include <time.h>
 
 extern int *socket_id;
+static int verify_nxt_colour_sensor(void);
 
 int map[400][4];            // This holds the representation of the map, up to 20x20
                             // intersections, raster ordered, 4 building colours per
@@ -108,10 +110,11 @@ int main(int argc, char *argv[])
  
  if (argc<4)
  {
-  fprintf(stderr,"Usage: EV3_Localization map_name dest_x dest_y [calibration_directory]\n");
+  fprintf(stderr,"Usage: EV3_Localization map_name dest_x dest_y calibration_directory\n");
   fprintf(stderr,"    map_name - should correspond to a properly formatted .ppm map image\n");
   fprintf(stderr,"    dest_x, dest_y - target location for the bot within the map, -1 -1 calls calibration routine\n");
   fprintf(stderr,"    calibration_directory - saved colour files to load once for get_sensor_color_robust()\n");
+  fprintf(stderr,"    append --read-colours to monitor the NXT sensor without moving\n");
   exit(1);
  }
  strcpy(&mapname[0],argv[1]);
@@ -126,7 +129,12 @@ int main(int argc, char *argv[])
   return calibration_status==0 ? 0 : 1;
  }
 
- if (argc>4&&load_colour_calibration(argv[4])!=0)
+ if (argc<5)
+ {
+  fprintf(stderr,"Pass a calibration directory to run the street search.\n");
+  return 1;
+ }
+ if (load_colour_calibration(argv[4])!=0)
  {
   fprintf(stderr,"Unable to load colour calibration from %s.\n",argv[4]);
   return 1;
@@ -181,6 +189,30 @@ int main(int argc, char *argv[])
  }
 
  fprintf(stderr,"All set, ready to go!\n");
+
+ if (verify_nxt_colour_sensor()!=0)
+ {
+  BT_close();
+  free(map_image);
+  return 1;
+ }
+
+ if (argc>5&&strcmp(argv[5],"--read-colours")==0)
+ {
+  printf("Reading NXT colours; press Ctrl+C to stop.\n");
+  for (;;)
+  {
+   int colour=get_sensor_color_robust();
+   if (colour<0)
+   {
+    fprintf(stderr,"NXT colour sensor read failed.\n");
+    BT_close();
+    free(map_image);
+    return 1;
+   }
+   usleep(200000);
+  }
+ }
  
 /*******************************************************************************************************************************
  *
@@ -223,28 +255,11 @@ int main(int argc, char *argv[])
 
 
  int sensor_status=0;
- if (argc<5)
- {
-  fprintf(stderr,"Pass a calibration directory to run the colour sensor loop.\n");
-  sensor_status=1;
- }
- else
- {
-  printf("Reading colours; press Ctrl+C to stop.\n");
-  for (;;)
-  {
-   int colour=get_sensor_color_robust();
-   if (colour<0)
-   {
-    fprintf(stderr,"Colour sensor read failed; stopping.\n");
-    sensor_status=1;
-    break;
-   }
-  printf("Colour: %s (%d)\n",get_colour_name(colour),colour);
-   fflush(stdout);
-   usleep(100000);
-  }
- }
+ if (beep()!=0) sensor_status=1;
+ else if (!find_street()) sensor_status=1;
+ if (beep()!=0) sensor_status=1;
+ usleep(150000);
+ if (beep()!=0) sensor_status=1;
  // Cleanup and exit - DO NOT WRITE ANY CODE BELOW THIS LINE
  BT_close();
  free(map_image);
@@ -266,6 +281,25 @@ int beep(void)
  return BT_play_tone_sequence(tones);
 }
 
+static int is_street_marker(MoveResult result)
+{
+ return result.reason==STOP_COLOUR&&(result.colour==1||result.colour==4);
+}
+
+static int turn_at_red_and_search(const int *stop_colours)
+{
+ const int street_colours[]={1,4};
+ MoveResult result=turn_in_place_until(180,0,street_colours,2,10000);
+ report_move_result("find street: red turnaround",result);
+ if (is_street_marker(result)) return 1;
+ if (result.reason!=STOP_ANGLE) return -1;
+ result=move_forward_until(stop_colours,3,0.75,15000);
+ report_move_result("find street: one-cell return",result);
+ if (is_street_marker(result)) return 1;
+ if (result.reason==STOP_COLOUR) return -1;
+ return result.reason==STOP_DISTANCE||result.reason==STOP_TIMEOUT ? 0 : -1;
+}
+
 int find_street(void)   
 {
  /*
@@ -274,8 +308,20 @@ int find_street(void)
   * 
   * You can use the return value to indicate success or failure, or to inform the rest of your code of the state of your
   * bot after calling this function
-  */   
-  return(0);
+  */
+ const int stop_colours[]={1,4,5};
+ MoveResult result=move_forward_until(stop_colours,3,0.75,15000);
+ report_move_result("find street: first one-cell leg",result);
+ if (is_street_marker(result)) return 1;
+
+ if (result.reason==STOP_COLOUR&&result.colour==5)
+ {
+  int recovery=turn_at_red_and_search(stop_colours);
+  return recovery==1;
+ }
+ if (result.reason==STOP_DISTANCE||result.reason==STOP_TIMEOUT)
+  fprintf(stderr,"No street marker found within one cell.\n");
+ return 0;
 }
 
 int drive_along_street(void)
@@ -498,8 +544,23 @@ static int wait_for_calibration_enter(void)
  return -1;
 }
 
-#define EV3_COLOUR_WHITE_MAX 305.0
-static int colour_calibration_loaded=0;      // References are usable only after all six files validate.
+static int verify_nxt_colour_sensor(void)
+{
+ unsigned char identify[]={opINPUT_DEVICE,GET_TYPEMODE,0,COLOUR_SENSOR_PORT,0x60,0x61};
+ unsigned char device[2];
+ if (calibration_command(identify,sizeof(identify),device,2)!=0||device[0]!=4)
+ {
+  fprintf(stderr,"Calibration requires an NXT colour sensor on input %d.\n",COLOUR_SENSOR_PORT+1);
+  return -1;
+ }
+ return 0;
+}
+
+#define CALIBRATION_SAMPLES_PER_COLOUR 30
+static const char *const calibration_colours[]={"red","green","blue","yellow","black","white"};
+static const int calibration_map_ids[]={5,3,2,4,1,6};
+static int colour_calibration_samples[6][CALIBRATION_SAMPLES_PER_COLOUR][3];
+static int colour_calibration_loaded=0;
 static int confirmed_colour=0;               // Last colour confirmed by three consecutive readings.
 static int candidate_colour=0;               // Colour currently accumulating a confirmation streak.
 static int candidate_count=0;                // Consecutive matches, capped at three.
@@ -514,34 +575,36 @@ void reset_sensor_color_filter(void)
 
 int load_colour_calibration(const char *directory)
 {
- // Validate the EV3 sensor's six 30-reading files; thresholds are from the previous EV3-based implementation.
- const char *colours[]={"red","green","blue","yellow","black","white"};
+ // Load six complete NXT captures for nearest-sample classification.
  colour_calibration_loaded=0;
  reset_sensor_color_filter();
  for (int colour_index=0;colour_index<6;colour_index++)
  {
   char filename[1024],header[128];
-  int length=snprintf(filename,sizeof(filename),"%s/%s.txt",directory,colours[colour_index]);
+  int length=snprintf(filename,sizeof(filename),"%s/%s.txt",directory,calibration_colours[colour_index]);
   if (length<0||(size_t)length>=sizeof(filename)) return -1;
   FILE *input=fopen(filename,"r");
   if (input==NULL) return -1;
-  if (fgets(header,sizeof(header),input)==NULL||strcmp(header,"sensor EV3 RGB\n")!=0||
+  if (fgets(header,sizeof(header),input)==NULL||strcmp(header,"sensor NXT RGB\n")!=0||
       fgets(header,sizeof(header),input)==NULL||strcmp(header,"sample R G B ambient\n")!=0)
   {
    fclose(input);
    return -1;
   }
-  // Reject incomplete captures and calibration files made by the NXT sensor.
+  // Reject EV3 files, incomplete captures, and impossible corrected NXT readings.
   int failed=0;
-  for (int sample=1;sample<=30;sample++)
+  for (int sample=1;sample<=CALIBRATION_SAMPLES_PER_COLOUR;sample++)
   {
    int index,red,green,blue,ambient;
    if (fscanf(input,"%d %d %d %d %d",&index,&red,&green,&blue,&ambient)!=5||index!=sample||
-    red<0||red>1020||green<0||green>1020||blue<0||blue>1020||ambient!=0)
+    red< -32767||red>32767||green< -32767||green>32767||blue< -32767||blue>32767||ambient<0||ambient>32767)
    {
-  failed=1;
-  break;
+    failed=1;
+    break;
    }
+   colour_calibration_samples[colour_index][sample-1][0]=red;
+   colour_calibration_samples[colour_index][sample-1][1]=green;
+   colour_calibration_samples[colour_index][sample-1][2]=blue;
   }
   // Allow trailing whitespace, but reject extra rows or text from an incompatible file format.
   int character;
@@ -551,33 +614,33 @@ int load_colour_calibration(const char *directory)
   fclose(input);
   if (failed) return -1;
  }
- // Enable the fixed EV3 thresholds only after every calibration file passes validation.
+ // Enable classification only after all six NXT calibration files validate.
  colour_calibration_loaded=1;
  return 0;
 }
 
-static int classify_sensor_rgb(const int channels[4])
+static int classify_sensor_rgb(const int channels[3])
 {
- // Apply the previous project's EV3 RGB thresholds after its whiteMax normalization.
+ // Choose the nearest captured NXT RGB sample, which uses the current room and sensor mounting calibration.
  if (!colour_calibration_loaded) return 0;
- int rgb[3];
- for (int channel=0;channel<3;channel++)
+ double nearest_distance=HUGE_VAL;
+ int nearest_colour=0;
+ for (int colour_index=0;colour_index<6;colour_index++)
+  for (int sample=0;sample<CALIBRATION_SAMPLES_PER_COLOUR;sample++)
  {
-  if (channels[channel]<0||channels[channel]>1020) return 0;
-  rgb[channel]=(int)(channels[channel]*256.0/EV3_COLOUR_WHITE_MAX);
+   double distance=0;
+   for (int channel=0;channel<3;channel++)
+   {
+    double difference=(double)channels[channel]-colour_calibration_samples[colour_index][sample][channel];
+    distance+=difference*difference;
+   }
+   if (distance<nearest_distance)
+   {
+    nearest_distance=distance;
+    nearest_colour=calibration_map_ids[colour_index];
+   }
  }
- if (rgb[0]>150&&rgb[1]>150&&rgb[2]>150) return 6;
- if (rgb[0]>200&&rgb[1]<100&&rgb[2]<100) return 5;
- if (rgb[0]>100&&rgb[1]>100&&rgb[2]<100) return 4;
- if (rgb[0]<50&&rgb[1]>40&&rgb[2]<60) return 3;
- if (rgb[2]>75) return 2;
- if (rgb[0]<50&&rgb[1]<50&&rgb[2]<50)
- {
-  int indexed=BT_read_colour_sensor(COLOUR_SENSOR_PORT);
-  if (indexed==3) return 3;
-  if (indexed==1) return 1;
- }
- return 0;
+ return nearest_colour;
 }
 
 static int update_sensor_color_filter(int colour)
@@ -603,23 +666,33 @@ static int update_sensor_color_filter(int colour)
 
 int get_sensor_color_robust(void)
 {
- // Read the EV3 RGB sensor, apply three-reading colour confirmation, and return a map ID (0=unknown, -1=read error).
- if (!colour_calibration_loaded) return -1;
- struct timeval timeout={5,0};
- if (setsockopt(*socket_id,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout))!=0||
-   setsockopt(*socket_id,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout))!=0)
-  return update_sensor_color_filter(-1);
- int rgb[3];
- if (BT_read_colour_sensor_RGB(COLOUR_SENSOR_PORT,rgb)!=0)
-  return update_sensor_color_filter(-1);
- int channels[4]={rgb[0],rgb[1],rgb[2],0};
- return update_sensor_color_filter(classify_sensor_rgb(channels));
+ // Read NXT corrected RGB, classify against saved samples, confirm three times, and print every request.
+ int colour;
+ if (!colour_calibration_loaded) colour=-1;
+ else
+ {
+  struct timeval timeout={5,0};
+  if (setsockopt(*socket_id,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout))!=0||
+      setsockopt(*socket_id,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout))!=0)
+   colour=update_sensor_color_filter(-1);
+  else
+  {
+    int rgb[3],ambient;
+    if (BT_read_colour_RGBraw_NXT(COLOUR_SENSOR_PORT,&rgb[0],&rgb[1],&rgb[2],&ambient)!=1||
+       rgb[0]< -32767||rgb[0]>32767||rgb[1]< -32767||rgb[1]>32767||rgb[2]< -32767||rgb[2]>32767||ambient<0||ambient>32767)
+     colour=update_sensor_color_filter(-1);
+    else
+     colour=update_sensor_color_filter(classify_sensor_rgb(rgb));
+  }
+ }
+ printf("Seeing colour: %s (%d)\n",get_colour_name(colour),colour);
+ fflush(stdout);
+ return colour;
 }
 
 int calibrate_sensor(void)
 {
- // On an open EV3 connection, save 30 RGB readings per colour across three spots; return 0 on success, -1 on failure.
- const char *colours[]={"red","green","blue","yellow","black","white"};
+ // On an open EV3 connection, save 30 NXT RGB+A readings per colour across three spots.
  struct timeval timeout={5,0};
  if (setsockopt(*socket_id,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout))!=0||
      setsockopt(*socket_id,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout))!=0)
@@ -627,13 +700,7 @@ int calibrate_sensor(void)
   perror("Unable to set calibration communication timeout");
   return -1;
  }
- unsigned char identify[]={opINPUT_DEVICE,GET_TYPEMODE,0,COLOUR_SENSOR_PORT,0x60,0x61};
- unsigned char device[2];
- if (calibration_command(identify,sizeof(identify),device,2)!=0||device[0]!=29)
- {
-  fprintf(stderr,"Calibration requires an EV3 colour sensor on input %d.\n",COLOUR_SENSOR_PORT+1);
-  return -1;
- }
+ if (verify_nxt_colour_sensor()!=0) return -1;
  if (mkdir("calibration",0755)!=0&&errno!=EEXIST)
  {
   perror("Unable to create calibration directory");
@@ -657,32 +724,32 @@ int calibrate_sensor(void)
  for (size_t colour_index=0;colour_index<6;colour_index++)
  {
   char filename[256];
-  snprintf(filename,sizeof(filename),"%s/%s.txt",directory,colours[colour_index]);
+   snprintf(filename,sizeof(filename),"%s/%s.txt",directory,calibration_colours[colour_index]);
   FILE *output=fopen(filename,"wx");
   if (output==NULL) {perror("Unable to create colour file");return -1;}
-  int failed=fprintf(output,"sensor EV3 RGB\nsample R G B ambient\n")<0;
-  // Store raw EV3 RGB from three positions; ambient is zero because this sensor mode does not report it.
-  for (int sample=1;sample<=30&&!failed;sample++)
+    int failed=fprintf(output,"sensor NXT RGB\nsample R G B ambient\n")<0;
+    for (int sample=1;sample<=CALIBRATION_SAMPLES_PER_COLOUR&&!failed;sample++)
   {
    if ((sample-1)%10==0)
    {
-    printf("Now reading %s: place sensor at distinct solid-colour spot %d/3 and press Enter.\n",
-           colours[colour_index],(sample-1)/10+1);
+        printf("Now reading %s: place sensor at distinct solid-colour spot %d/3 and press Enter.\n",
+          calibration_colours[colour_index],(sample-1)/10+1);
     fflush(stdout);
     if (wait_for_calibration_enter()!=0) {failed=1;break;}
    }
-   int channels[3];
-   if (BT_read_colour_sensor_RGB(COLOUR_SENSOR_PORT,channels)!=0)
+  int channels[3],ambient;
+  if (BT_read_colour_RGBraw_NXT(COLOUR_SENSOR_PORT,&channels[0],&channels[1],&channels[2],&ambient)!=1)
    {
     fprintf(stderr,"Sensor read failed; %s is incomplete.\n",filename);
     failed=1;
     break;
    }
-   for (int channel=0;channel<3;channel++)
-    if (channels[channel]<0||channels[channel]>1020) failed=1;
-   failed=fprintf(output,"%d %d %d %d 0\n",sample,channels[0],channels[1],channels[2])<0||failed;
+  for (int channel=0;channel<3;channel++)
+   if (channels[channel]< -32767||channels[channel]>32767) failed=1;
+  if (ambient<0||ambient>32767) failed=1;
+  failed=fprintf(output,"%d %d %d %d %d\n",sample,channels[0],channels[1],channels[2],ambient)<0||failed;
    if (fflush(output)!=0) failed=1;
-   printf("%s %d/30: R=%d G=%d B=%d\n",colours[colour_index],sample,channels[0],channels[1],channels[2]);
+  printf("%s %d/30: R=%d G=%d B=%d A=%d\n",calibration_colours[colour_index],sample,channels[0],channels[1],channels[2],ambient);
    if (sample%10!=0) usleep(100000);
    else if (!failed&&beep()!=0) failed=1;
   }
@@ -690,9 +757,221 @@ int calibrate_sensor(void)
   if (fclose(output)!=0) failed=1;
   if (failed) {fprintf(stderr,"Calibration stopped; check %s.\n",filename);return -1;}
   if (beep()!=0) {fprintf(stderr,"Completion beep failed.\n");return -1;}
-  printf("Saved 30 EV3 RGB readings to %s\n",filename);
+  printf("Saved 30 NXT RGB+A readings to %s\n",filename);
  }
- printf("EV3 threshold calibration capture complete.\n");
+ printf("NXT calibration capture complete.\n");
+ return 0;
+}
+
+// ---- Smooth movement: gyro-held straight drives and gyro-controlled turns ----
+#define MOVE_CRUISE_POWER 10
+#define MOVE_MIN_POWER 14
+#define MOVE_RAMP_UP_MS 500
+#define MOVE_RAMP_DOWN_DEGREES 90.0
+#define MOVE_HEADING_GAIN 1.5
+#define MOVE_HEADING_LIMIT 8
+#define TURN_MAX_POWER 30
+#define TURN_GAIN 0.6
+#define TURN_TOLERANCE_DEGREES 2
+#define TURN_SETTLE_US 150000
+#define TURN_DEFAULT_TIMEOUT_MS 10000
+
+enum {ROTATE_BOTH=0, ROTATE_LEFT_WHEEL=1, ROTATE_RIGHT_WHEEL=2};
+
+static long elapsed_ms(const struct timespec *start)
+{
+ struct timespec now;
+ clock_gettime(CLOCK_MONOTONIC,&now);
+ return (now.tv_sec-start->tv_sec)*1000L+(now.tv_nsec-start->tv_nsec)/1000000L;
+}
+
+static MoveResult stop_with(StopReason reason,int colour)
+{
+ MoveResult result={reason,colour};
+ // Always brake, including on errors, so a failed read can never leave the wheels running.
+ if (BT_motor_port_stop(MOTOR_B|MOTOR_C,1)!=0) result.reason=STOP_ERROR;
+ return result;
+}
+
+static int movement_setup(const int *colours,int count)
+{
+ if (count<0||(count>0&&colours==NULL)) return -1;
+ for (int i=0;i<count;i++)
+  if (colours[i]<1||colours[i]>6) return -1;
+ struct timeval timeout={5,0};
+ if (setsockopt(*socket_id,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout))!=0||
+     setsockopt(*socket_id,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout))!=0) return -1;
+ // Require fresh confirmations so a colour seen before the move cannot trigger an immediate stop.
+ reset_sensor_color_filter();
+ return 0;
+}
+
+static int read_wheel_degrees(int *right,int *left)
+{
+ // Output indexes: A=0, B=1 (right wheel), C=2 (left wheel); counts are 32-bit little endian.
+ const unsigned char operations[]={opOUTPUT_GET_COUNT,LC0(0),LC0(1),GV0(0),opOUTPUT_GET_COUNT,LC0(0),LC0(2),GV0(4)};
+ unsigned char payload[8];
+ if (calibration_command(operations,sizeof(operations),payload,sizeof(payload))!=0) return -1;
+ *right=(int32_t)((uint32_t)payload[0]|(uint32_t)payload[1]<<8|(uint32_t)payload[2]<<16|(uint32_t)payload[3]<<24);
+ *left=(int32_t)((uint32_t)payload[4]|(uint32_t)payload[5]<<8|(uint32_t)payload[6]<<16|(uint32_t)payload[7]<<24);
+ return 0;
+}
+
+static int hit_stop_colour(const int *colours,int count)
+{
+ // Returns the matching colour ID, 0 for no match, -1 on a read error.
+ int colour=get_sensor_color_robust();
+ if (colour<0) return -1;
+ for (int i=0;i<count;i++)
+  if (colours[i]==colour) return colour;
+ return 0;
+}
+
+static int ramp_power(int target_power,long elapsed)
+{
+ // Linear rise from the minimum power so the wheels never jerk up to speed.
+ if (elapsed>=MOVE_RAMP_UP_MS) return target_power;
+ return MOVE_MIN_POWER+(int)((target_power-MOVE_MIN_POWER)*elapsed/MOVE_RAMP_UP_MS);
+}
+
+static int clamp_power(int power)
+{
+ return power>100 ? 100 : (power<-100 ? -100 : power);
+}
+
+static MoveResult drive_straight(int direction,const int *stop_colours,int colour_count,double max_revolutions,int timeout_ms)
+{
+ MoveResult failed={STOP_ERROR,0};
+ if (movement_setup(stop_colours,colour_count)!=0||(max_revolutions<=0&&timeout_ms<=0)) return failed;
+ int angle,rate,right0,left0;
+ if (BT_read_gyro(GYRO_SENSOR_PORT,1,&angle,&rate)!=1||read_wheel_degrees(&right0,&left0)!=0) return failed;
+ double limit=max_revolutions>0 ? max_revolutions*360.0 : 0;
+ struct timespec start;
+ clock_gettime(CLOCK_MONOTONIC,&start);
+ for (;;)
+ {
+  long elapsed=elapsed_ms(&start);
+  if (timeout_ms>0&&elapsed>=timeout_ms) return stop_with(STOP_TIMEOUT,0);
+  int right,left;
+  if (read_wheel_degrees(&right,&left)!=0) return stop_with(STOP_ERROR,0);
+  double travelled=(abs(right-right0)+abs(left-left0))/2.0;
+  if (limit>0&&travelled>=limit) return stop_with(STOP_DISTANCE,0);
+  if (colour_count>0)
+  {
+   int colour=get_sensor_color_robust();
+   if (colour<0) return stop_with(STOP_ERROR,0);
+   for (int stop_index=0;stop_index<colour_count;stop_index++)
+    if (colour==stop_colours[stop_index]) return stop_with(STOP_COLOUR,colour);
+  }
+  if (BT_read_gyro(GYRO_SENSOR_PORT,0,&angle,&rate)!=1) return stop_with(STOP_ERROR,0);
+  int magnitude=ramp_power(MOVE_CRUISE_POWER,elapsed);
+  if (limit>0&&limit-travelled<MOVE_RAMP_DOWN_DEGREES)
+  {
+   // Slow smoothly over the final stretch of a distance-limited move.
+   int tapered=MOVE_MIN_POWER+(int)((MOVE_CRUISE_POWER-MOVE_MIN_POWER)*(limit-travelled)/MOVE_RAMP_DOWN_DEGREES);
+   if (tapered<magnitude) magnitude=tapered;
+  }
+  // Gyro angle grows clockwise; a positive angle is drift to the right, so speed up the right wheel.
+  int correction=(int)(MOVE_HEADING_GAIN*angle);
+  if (correction>MOVE_HEADING_LIMIT) correction=MOVE_HEADING_LIMIT;
+  if (correction<-MOVE_HEADING_LIMIT) correction=-MOVE_HEADING_LIMIT;
+  int base=direction*magnitude;
+  if (BT_turn(MOTOR_C,clamp_power(base-correction),MOTOR_B,clamp_power(base+correction))!=0)
+   return stop_with(STOP_ERROR,0);
+ }
+}
+
+static MoveResult rotate_gyro(int wheels,int turn_right,int angle_degrees,const int *stop_colours,int colour_count,int timeout_ms)
+{
+ MoveResult failed={STOP_ERROR,0};
+ if (angle_degrees<1||angle_degrees>360||movement_setup(stop_colours,colour_count)!=0) return failed;
+ // A turn always has a bound, so a dead gyro cannot spin the robot forever.
+ if (timeout_ms<=0) timeout_ms=TURN_DEFAULT_TIMEOUT_MS;
+ int angle,rate;
+ if (BT_read_gyro(GYRO_SENSOR_PORT,1,&angle,&rate)!=1) return failed;
+ int target=turn_right ? angle_degrees : -angle_degrees;
+ struct timespec start;
+ clock_gettime(CLOCK_MONOTONIC,&start);
+ for (;;)
+ {
+  long elapsed=elapsed_ms(&start);
+  if (elapsed>=timeout_ms) return stop_with(STOP_TIMEOUT,0);
+  if (BT_read_gyro(GYRO_SENSOR_PORT,0,&angle,&rate)!=1) return stop_with(STOP_ERROR,0);
+  if (colour_count>0)
+  {
+   int colour=hit_stop_colour(stop_colours,colour_count);
+   if (colour<0) return stop_with(STOP_ERROR,0);
+   if (colour>0) return stop_with(STOP_COLOUR,colour);
+  }
+  int error=target-angle;
+  if (abs(error)<=TURN_TOLERANCE_DEGREES)
+  {
+   // Brake, let momentum settle, and accept only if the heading is still on target.
+   MoveResult braked=stop_with(STOP_ANGLE,0);
+   if (braked.reason!=STOP_ANGLE) return braked;
+   usleep(TURN_SETTLE_US);
+   if (BT_read_gyro(GYRO_SENSOR_PORT,0,&angle,&rate)!=1) return failed;
+   if (abs(target-angle)<=TURN_TOLERANCE_DEGREES) return braked;
+   continue;
+  }
+  // Power tapers with the remaining error; a negative error (overshoot) reverses the wheels to correct.
+  int magnitude=(int)(TURN_GAIN*abs(error));
+  int ceiling=ramp_power(TURN_MAX_POWER,elapsed);
+  if (magnitude<MOVE_MIN_POWER) magnitude=MOVE_MIN_POWER;
+  if (magnitude>ceiling) magnitude=ceiling;
+  int direction=error>0 ? 1 : -1;
+  // Clockwise = left wheel forward and/or right wheel backward.
+  int left=wheels!=ROTATE_RIGHT_WHEEL ? direction*magnitude : 0;
+  int right=wheels!=ROTATE_LEFT_WHEEL ? -direction*magnitude : 0;
+  if (BT_turn(MOTOR_C,left,MOTOR_B,right)!=0) return stop_with(STOP_ERROR,0);
+ }
+}
+
+MoveResult move_forward_until(const int *stop_colours,int colour_count,double max_revolutions,int timeout_ms)
+{
+ return drive_straight(1,stop_colours,colour_count,max_revolutions,timeout_ms);
+}
+
+MoveResult move_backward_until(const int *stop_colours,int colour_count,double max_revolutions,int timeout_ms)
+{
+ return drive_straight(-1,stop_colours,colour_count,max_revolutions,timeout_ms);
+}
+
+MoveResult pivot_single_wheel(int angle_degrees,int turn_direction,int reverse,const int *stop_colours,int colour_count,int timeout_ms)
+{
+ MoveResult failed={STOP_ERROR,0};
+ if (turn_direction!=0&&turn_direction!=1) return failed;
+ int turn_right=turn_direction==0;
+ // Left wheel drives a right-forward or left-reverse pivot; the right wheel drives the other two.
+ int wheels=turn_right!=(reverse!=0) ? ROTATE_LEFT_WHEEL : ROTATE_RIGHT_WHEEL;
+ return rotate_gyro(wheels,turn_right,angle_degrees,stop_colours,colour_count,timeout_ms);
+}
+
+MoveResult turn_in_place(int angle_degrees,int turn_direction,int timeout_ms)
+{
+ MoveResult failed={STOP_ERROR,0};
+ if (turn_direction!=0&&turn_direction!=1) return failed;
+ return rotate_gyro(ROTATE_BOTH,turn_direction==0,angle_degrees,NULL,0,timeout_ms);
+}
+
+MoveResult turn_in_place_until(int angle_degrees,int turn_direction,const int *stop_colours,int colour_count,int timeout_ms)
+{
+ MoveResult failed={STOP_ERROR,0};
+ if (turn_direction!=0&&turn_direction!=1) return failed;
+ return rotate_gyro(ROTATE_BOTH,turn_direction==0,angle_degrees,stop_colours,colour_count,timeout_ms);
+}
+
+int report_move_result(const char *label,MoveResult result)
+{
+ // Prints why a move ended; returns 1 for an error so callers can abort a sequence.
+ switch (result.reason)
+ {
+  case STOP_TIMEOUT: printf("%s: stopped by timeout\n",label); break;
+  case STOP_DISTANCE: printf("%s: stopped by distance limit\n",label); break;
+  case STOP_COLOUR: printf("%s: stopped by colour %s (%d)\n",label,get_colour_name(result.colour),result.colour); break;
+  case STOP_ANGLE: printf("%s: angle reached\n",label); break;
+  default: fprintf(stderr,"%s: error, motors braked\n",label); return 1;
+ }
  return 0;
 }
 
@@ -792,7 +1071,7 @@ int parse_map(unsigned char *map_img, int rx, int ry)
     for (int k=i; k<rx; k++)        // Find width and horizontal distance to next intersection
     {
      R=*(map_img+((k+(by*rx))*3));
-     G=*(map_img+((k+(by*rx))*3)+1);
+     struct timeval timeout={0,500000};
      B=*(map_img+((k+(by*rx))*3)+2);
      if (tgl==0&&(R!=255||G!=255||B!=0))
      {
