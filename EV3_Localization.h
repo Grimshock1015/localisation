@@ -85,7 +85,7 @@ int get_sensor_color_robust(void);
 const char *get_colour_name(int colour);
 void reset_sensor_color_filter(void);
 #ifndef COLOUR_SENSOR_PORT
-#define COLOUR_SENSOR_PORT PORT_2
+#define COLOUR_SENSOR_PORT PORT_3
 #endif
 int beep(void);
 unsigned char *readPPMimage(const char *filename, int *rx, int*ry);

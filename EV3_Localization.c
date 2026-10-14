@@ -498,9 +498,7 @@ static int wait_for_calibration_enter(void)
  return -1;
 }
 
-static double colour_means[6][3];             // Ambient-corrected RGB references, cached after loading.
-static double colour_radius_squared[6];      // Squared RGB distance allowed around each reference.
-static const int colour_ids[6]={5,3,2,4,1,6}; // Capture order mapped to the map's colour IDs.
+#define EV3_COLOUR_WHITE_MAX 305.0
 static int colour_calibration_loaded=0;      // References are usable only after all six files validate.
 static int confirmed_colour=0;               // Last colour confirmed by three consecutive readings.
 static int candidate_colour=0;               // Colour currently accumulating a confirmation streak.
@@ -516,10 +514,8 @@ void reset_sensor_color_filter(void)
 
 int load_colour_calibration(const char *directory)
 {
- // Load six 15-sample files once, cache corrected RGB means and rejection radii; return 0 or -1 and reset filter history.
+ // Validate the EV3 sensor's six 30-reading files; thresholds are from the previous EV3-based implementation.
  const char *colours[]={"red","green","blue","yellow","black","white"};
- // Build locally and disable classification until the entire replacement model is valid.
- double means[6][3]={0};
  colour_calibration_loaded=0;
  reset_sensor_color_filter();
  for (int colour_index=0;colour_index<6;colour_index++)
@@ -529,26 +525,23 @@ int load_colour_calibration(const char *directory)
   if (length<0||(size_t)length>=sizeof(filename)) return -1;
   FILE *input=fopen(filename,"r");
   if (input==NULL) return -1;
-  if (fgets(header,sizeof(header),input)==NULL||strcmp(header,"sample R G B ambient\n")!=0)
+  if (fgets(header,sizeof(header),input)==NULL||strcmp(header,"sensor EV3 RGB\n")!=0||
+      fgets(header,sizeof(header),input)==NULL||strcmp(header,"sample R G B ambient\n")!=0)
   {
    fclose(input);
    return -1;
   }
-  // Require all 15 numbered rows; incomplete captures must not silently bias the colour reference.
+  // Reject incomplete captures and calibration files made by the NXT sensor.
   int failed=0;
-  for (int sample=1;sample<=15;sample++)
+  for (int sample=1;sample<=30;sample++)
   {
    int index,red,green,blue,ambient;
    if (fscanf(input,"%d %d %d %d %d",&index,&red,&green,&blue,&ambient)!=5||index!=sample||
-     red<0||red>32767||green<0||green>32767||blue<0||blue>32767||ambient<0||ambient>32767)
+    red<0||red>1020||green<0||green>1020||blue<0||blue>1020||ambient!=0)
    {
   failed=1;
   break;
    }
-  // Preserve absolute brightness to distinguish black from white; only subtract measured ambient light.
-  means[colour_index][0]+=(red-ambient)/15.0;
-   means[colour_index][1]+=(green-ambient)/15.0;
-   means[colour_index][2]+=(blue-ambient)/15.0;
   }
   // Allow trailing whitespace, but reject extra rows or text from an incompatible file format.
   int character;
@@ -558,54 +551,33 @@ int load_colour_calibration(const char *directory)
   fclose(input);
   if (failed) return -1;
  }
- // Derive each acceptance radius from its closest competing colour, not the capture's narrow min/max range.
- for (int colour_index=0;colour_index<6;colour_index++)
- {
-  double nearest_squared=1e30;
-  for (int other=0;other<6;other++)
-  {
-   if (other==colour_index) continue;
-   double distance_squared=0;
-   for (int channel=0;channel<3;channel++)
-   {
-  double difference=means[colour_index][channel]-means[other][channel];
-  distance_squared+=difference*difference;
-   }
-   if (distance_squared<nearest_squared) nearest_squared=distance_squared;
-  }
-  // Nearly identical references cannot reliably distinguish their labels.
-  if (nearest_squared<1) return -1;
-  // Radius is 40% of nearest-reference distance (0.4 squared); validate this heuristic with independent captures.
-  colour_radius_squared[colour_index]=0.16*nearest_squared;
- }
- memcpy(colour_means,means,sizeof(means));
+ // Enable the fixed EV3 thresholds only after every calibration file passes validation.
  colour_calibration_loaded=1;
  return 0;
 }
 
 static int classify_sensor_rgb(const int channels[4])
 {
- // Compare one ambient-corrected sample to cached references; this function performs no file or sensor I/O.
+ // Apply the previous project's EV3 RGB thresholds after its whiteMax normalization.
  if (!colour_calibration_loaded) return 0;
- int closest=-1;
- double best_squared=1e30;
- for (int colour_index=0;colour_index<6;colour_index++)
+ int rgb[3];
+ for (int channel=0;channel<3;channel++)
  {
-  // Squared Euclidean distance gives the same nearest mean without computing square roots.
-  double distance_squared=0;
-  for (int channel=0;channel<3;channel++)
-  {
-   double difference=channels[channel]-channels[3]-colour_means[colour_index][channel];
-   distance_squared+=difference*difference;
-  }
-  if (distance_squared<best_squared)
-  {
-   best_squared=distance_squared;
-   closest=colour_index;
-  }
+  if (channels[channel]<0||channels[channel]>1020) return 0;
+  rgb[channel]=(int)(channels[channel]*256.0/EV3_COLOUR_WHITE_MAX);
  }
- // Even an unrelated surface has a nearest reference; reject it unless it is close enough.
- return best_squared<=colour_radius_squared[closest] ? colour_ids[closest] : 0;
+ if (rgb[0]>150&&rgb[1]>150&&rgb[2]>150) return 6;
+ if (rgb[0]>200&&rgb[1]<100&&rgb[2]<100) return 5;
+ if (rgb[0]>100&&rgb[1]>100&&rgb[2]<100) return 4;
+ if (rgb[0]<50&&rgb[1]>40&&rgb[2]<60) return 3;
+ if (rgb[2]>75) return 2;
+ if (rgb[0]<50&&rgb[1]<50&&rgb[2]<50)
+ {
+  int indexed=BT_read_colour_sensor(COLOUR_SENSOR_PORT);
+  if (indexed==3) return 3;
+  if (indexed==1) return 1;
+ }
+ return 0;
 }
 
 static int update_sensor_color_filter(int colour)
@@ -631,31 +603,22 @@ static int update_sensor_color_filter(int colour)
 
 int get_sensor_color_robust(void)
 {
- // Requires loaded calibration and an open socket; one fresh sample per call returns confirmed ID, initially 0, or -1 on failure.
+ // Read the EV3 RGB sensor, apply three-reading colour confirmation, and return a map ID (0=unknown, -1=read error).
  if (!colour_calibration_loaded) return -1;
  struct timeval timeout={5,0};
  if (setsockopt(*socket_id,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout))!=0||
    setsockopt(*socket_id,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout))!=0)
   return update_sensor_color_filter(-1);
- // Type 4/mode 5 returns packed 16-bit RGBA within the 12-byte raw reply allocation.
- unsigned char operations[]={opINPUT_DEVICE,READY_RAW,0,COLOUR_SENSOR_PORT,4,5,3,0x60,0x64,0x68};
- unsigned char payload[12];
- if (calibration_command(operations,sizeof(operations),payload,sizeof(payload))!=0)
+ int rgb[3];
+ if (BT_read_colour_sensor_RGB(COLOUR_SENSOR_PORT,rgb)!=0)
   return update_sensor_color_filter(-1);
- int channels[4];
- // Negative signed channel values indicate invalid data, not a colour transition worth confirming.
- for (int channel=0;channel<4;channel++)
- {
-  int value=payload[2*channel]+256*payload[2*channel+1];
-  if (value>=32768) return update_sensor_color_filter(0);
-  channels[channel]=value;
- }
+ int channels[4]={rgb[0],rgb[1],rgb[2],0};
  return update_sensor_color_filter(classify_sensor_rgb(channels));
 }
 
 int calibrate_sensor(void)
 {
- // On an open NXT connection, prompt for six colours and save 15 unprocessed RGBA samples each to a unique run; return 0 or -1.
+ // On an open EV3 connection, save 30 RGB readings per colour across three spots; return 0 on success, -1 on failure.
  const char *colours[]={"red","green","blue","yellow","black","white"};
  struct timeval timeout={5,0};
  if (setsockopt(*socket_id,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout))!=0||
@@ -666,9 +629,9 @@ int calibrate_sensor(void)
  }
  unsigned char identify[]={opINPUT_DEVICE,GET_TYPEMODE,0,COLOUR_SENSOR_PORT,0x60,0x61};
  unsigned char device[2];
- if (calibration_command(identify,sizeof(identify),device,2)!=0||device[0]!=4)
+ if (calibration_command(identify,sizeof(identify),device,2)!=0||device[0]!=29)
  {
-  fprintf(stderr,"Calibration requires an NXT colour sensor on input %d.\n",COLOUR_SENSOR_PORT+1);
+  fprintf(stderr,"Calibration requires an EV3 colour sensor on input %d.\n",COLOUR_SENSOR_PORT+1);
   return -1;
  }
  if (mkdir("calibration",0755)!=0&&errno!=EEXIST)
@@ -676,60 +639,60 @@ int calibrate_sensor(void)
   perror("Unable to create calibration directory");
   return -1;
  }
- // A unique run preserves earlier captures and keeps partial/failed sessions separate from complete ones.
- char directory[]="calibration/run-XXXXXX";
- if (mkdtemp(directory)==NULL)
+ // Use the first unused numeric folder and preserve all earlier calibration runs.
+ char directory[64];
+ int run_number;
+ for (run_number=1;run_number<1000000;run_number++)
  {
-  perror("Unable to create calibration session");
+  snprintf(directory,sizeof(directory),"calibration/run-%d",run_number);
+  if (mkdir(directory,0755)==0) break;
+  if (errno!=EEXIST) {perror("Unable to create calibration session");return -1;}
+ }
+ if (run_number==1000000)
+ {
+  fprintf(stderr,"No unused calibration run number available.\n");
   return -1;
  }
  printf("Saving raw calibration readings in %s\n",directory);
  for (size_t colour_index=0;colour_index<6;colour_index++)
  {
-  printf("Now reading %s colour: please move the colour sensor over %s and press Enter in this terminal.\n",
-    colours[colour_index],colours[colour_index]);
-  fflush(stdout);
-  if (wait_for_calibration_enter()!=0)
-  {
-   fprintf(stderr,"Terminal input closed; calibration stopped.\n");
-   return -1;
-  }
   char filename[256];
   snprintf(filename,sizeof(filename),"%s/%s.txt",directory,colours[colour_index]);
   FILE *output=fopen(filename,"wx");
   if (output==NULL) {perror("Unable to create colour file");return -1;}
-  int failed=fprintf(output,"sample R G B ambient\n")<0;
-  // Store uncorrected channels so later processing can change without requiring a new hardware capture.
-  for (int sample=1;sample<=15&&!failed;sample++)
+  int failed=fprintf(output,"sensor EV3 RGB\nsample R G B ambient\n")<0;
+  // Store raw EV3 RGB from three positions; ambient is zero because this sensor mode does not report it.
+  for (int sample=1;sample<=30&&!failed;sample++)
   {
-   unsigned char operations[]={opINPUT_DEVICE,READY_RAW,0,COLOUR_SENSOR_PORT,4,5,3,0x60,0x64,0x68};
-   unsigned char payload[12];
-   if (calibration_command(operations,sizeof(operations),payload,sizeof(payload))!=0)
+   if ((sample-1)%10==0)
+   {
+    printf("Now reading %s: place sensor at distinct solid-colour spot %d/3 and press Enter.\n",
+           colours[colour_index],(sample-1)/10+1);
+    fflush(stdout);
+    if (wait_for_calibration_enter()!=0) {failed=1;break;}
+   }
+   int channels[3];
+   if (BT_read_colour_sensor_RGB(COLOUR_SENSOR_PORT,channels)!=0)
    {
     fprintf(stderr,"Sensor read failed; %s is incomplete.\n",filename);
     failed=1;
     break;
    }
-   int channels[4];
-   // NXT mode 5 packs four 16-bit channels into the raw payload.
-   for (int channel=0;channel<4;channel++)
-   {
-    int value=payload[2*channel]+256*payload[2*channel+1];
-    channels[channel]=value>=32768 ? value-65536 : value;
-   }
-   failed=fprintf(output,"%d %d %d %d %d\n",sample,channels[0],channels[1],channels[2],channels[3])<0;
+   for (int channel=0;channel<3;channel++)
+    if (channels[channel]<0||channels[channel]>1020) failed=1;
+   failed=fprintf(output,"%d %d %d %d 0\n",sample,channels[0],channels[1],channels[2])<0||failed;
    if (fflush(output)!=0) failed=1;
-   printf("%s %d/15: R=%d G=%d B=%d ambient=%d\n",colours[colour_index],sample,
-     channels[0],channels[1],channels[2],channels[3]);
-   if (sample<15) usleep(100000);
+   printf("%s %d/30: R=%d G=%d B=%d\n",colours[colour_index],sample,channels[0],channels[1],channels[2]);
+   if (sample%10!=0) usleep(100000);
+   else if (!failed&&beep()!=0) failed=1;
   }
   // Signal completion only after all rows have been written and the file has closed successfully.
   if (fclose(output)!=0) failed=1;
   if (failed) {fprintf(stderr,"Calibration stopped; check %s.\n",filename);return -1;}
   if (beep()!=0) {fprintf(stderr,"Completion beep failed.\n");return -1;}
-  printf("Saved 15 readings to %s\n",filename);
+  printf("Saved 30 EV3 RGB readings to %s\n",filename);
  }
- printf("Calibration capture complete. No averaging or colour classification applied.\n");
+ printf("EV3 threshold calibration capture complete.\n");
  return 0;
 }
 
