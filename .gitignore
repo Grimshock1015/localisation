@@ -1,0 +1,10 @@
+/EV3_RobotControl/
+/logs/
+/build/
+a.out
+*.o
+*.d
+__pycache__/
+*.py[cod]
+core
+core.*
