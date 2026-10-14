@@ -71,6 +71,7 @@ int BT_close()
  fprintf(stderr,"Request to close connection to device at socket id %d\n",*socket_id);
  close(*socket_id);
  free(socket_id);
+ return(0);
 }
 
 
@@ -139,6 +140,7 @@ int BT_setEV3name(const char *name)
   fprintf(stderr,"BT_setEV3name(): Command failed, name must not contain spaces or special characters\n");
  
  message_id_counter++;
+ return(0);
 }
 
 

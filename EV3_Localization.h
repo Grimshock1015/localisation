@@ -80,6 +80,7 @@ int drive_along_street(void);
 int scan_intersection(int *tl, int *tr, int *br, int *bl);
 int turn_at_intersection(int turn_direction);
 void calibrate_sensor(void);
+int beep(void);
 unsigned char *readPPMimage(const char *filename, int *rx, int*ry);
 
 #endif

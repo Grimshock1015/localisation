@@ -211,10 +211,18 @@ int main(int argc, char *argv[])
  //        robot to complete its task should be here.
 
 
+ beep();
+ beep();
  // Cleanup and exit - DO NOT WRITE ANY CODE BELOW THIS LINE
  BT_close();
  free(map_image);
  exit(0);
+}
+
+int beep(void)
+{
+ int tones[50][3]={{880,200,25},{-1,-1,-1}};
+ return BT_play_tone_sequence(tones);
 }
 
 int find_street(void)   
