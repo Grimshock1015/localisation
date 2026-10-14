@@ -79,7 +79,14 @@ int find_street(void);
 int drive_along_street(void);
 int scan_intersection(int *tl, int *tr, int *br, int *bl);
 int turn_at_intersection(int turn_direction);
-void calibrate_sensor(void);
+int calibrate_sensor(void);
+int load_colour_calibration(const char *directory);
+int get_sensor_color_robust(void);
+const char *get_colour_name(int colour);
+void reset_sensor_color_filter(void);
+#ifndef COLOUR_SENSOR_PORT
+#define COLOUR_SENSOR_PORT PORT_2
+#endif
 int beep(void);
 unsigned char *readPPMimage(const char *filename, int *rx, int*ry);
 

@@ -88,6 +88,8 @@
 
 #include "EV3_Localization.h"
 
+extern int *socket_id;
+
 int map[400][4];            // This holds the representation of the map, up to 20x20
                             // intersections, raster ordered, 4 building colours per
                             // intersection.
@@ -106,9 +108,10 @@ int main(int argc, char *argv[])
  
  if (argc<4)
  {
-  fprintf(stderr,"Usage: EV3_Localization map_name dest_x dest_y\n");
+  fprintf(stderr,"Usage: EV3_Localization map_name dest_x dest_y [calibration_directory]\n");
   fprintf(stderr,"    map_name - should correspond to a properly formatted .ppm map image\n");
   fprintf(stderr,"    dest_x, dest_y - target location for the bot within the map, -1 -1 calls calibration routine\n");
+  fprintf(stderr,"    calibration_directory - saved colour files to load once for get_sensor_color_robust()\n");
   exit(1);
  }
  strcpy(&mapname[0],argv[1]);
@@ -117,8 +120,16 @@ int main(int argc, char *argv[])
 
  if (dest_x==-1&&dest_y==-1)
  {
-  calibrate_sensor();
-  exit(1);
+  if (BT_open(HEXKEY)!=0) return 1;
+  int calibration_status=calibrate_sensor();
+  BT_close();
+  return calibration_status==0 ? 0 : 1;
+ }
+
+ if (argc>4&&load_colour_calibration(argv[4])!=0)
+ {
+  fprintf(stderr,"Unable to load colour calibration from %s.\n",argv[4]);
+  return 1;
  }
 
  /******************************************************************************************************************
@@ -211,12 +222,42 @@ int main(int argc, char *argv[])
  //        robot to complete its task should be here.
 
 
- beep();
- beep();
+ int sensor_status=0;
+ if (argc<5)
+ {
+  fprintf(stderr,"Pass a calibration directory to run the colour sensor loop.\n");
+  sensor_status=1;
+ }
+ else
+ {
+  printf("Reading colours; press Ctrl+C to stop.\n");
+  for (;;)
+  {
+   int colour=get_sensor_color_robust();
+   if (colour<0)
+   {
+    fprintf(stderr,"Colour sensor read failed; stopping.\n");
+    sensor_status=1;
+    break;
+   }
+  printf("Colour: %s (%d)\n",get_colour_name(colour),colour);
+   fflush(stdout);
+   usleep(100000);
+  }
+ }
  // Cleanup and exit - DO NOT WRITE ANY CODE BELOW THIS LINE
  BT_close();
  free(map_image);
- exit(0);
+ exit(sensor_status);
+}
+
+const char *get_colour_name(int colour)
+{
+ // Return a persistent name for map colour IDs; distinguish read errors from unknown colours.
+ static const char *const names[]={"unknown","black","blue","green","yellow","red","white"};
+ if (colour==-1) return "read error";
+ if (colour<0||colour>6) return "unknown";
+ return names[colour];
 }
 
 int beep(void)
@@ -394,28 +435,302 @@ int go_to_target(int robot_x, int robot_y, int direction, int target_x, int targ
   return(0);  
 }
 
-void calibrate_sensor(void)
+static int calibration_command(const unsigned char *operations, size_t operation_size,
+           unsigned char *payload, size_t payload_size)
 {
- /*
-  * This function is called when the program is started with -1  -1 for the target location. 
-  *
-  * You DO NOT NEED TO IMPLEMENT ANYTHING HERE - but it is strongly recommended as good calibration will make sensor
-  * readings more reliable and will make your code more resistent to changes in illumination, map quality, or battery
-  * level.
-  * 
-  * The principle is - Your code should allow you to sample the different colours in the map, and store representative
-  * values that will help you figure out what colours the sensor is reading given the current conditions.
-  * 
-  * Inputs - None
-  * Return values - None - your code has to save the calibration information to a file, for later use (see in main())
-  * 
-  * How to do this part is up to you, but feel free to talk with your TA and instructor about it!
-  */   
+ // Frame one direct command, transfer the complete reply, validate its ID/status/size, and copy globals; return 0 or -1.
+ unsigned char packet[64], response[64];
+ unsigned int message_id=(unsigned int)message_id_counter++ & 0xffff;
+ size_t packet_size=7+operation_size;
+ if (packet_size>sizeof(packet)||payload_size>sizeof(response)-3) return -1;
+ // Header: little-endian length excluding itself, message ID, reply request, and global-memory allocation.
+ packet[0]=(unsigned char)(packet_size-2);
+ packet[1]=0;
+ packet[2]=(unsigned char)message_id;
+ packet[3]=(unsigned char)(message_id>>8);
+ packet[4]=0;
+ packet[5]=(unsigned char)payload_size;
+ packet[6]=0;
+ memcpy(packet+7,operations,operation_size);
+ // Partial transfers are legal; retry interrupted calls without resending bytes already delivered.
+ size_t transferred=0;
+ while (transferred<packet_size)
+ {
+  ssize_t count=send(*socket_id,packet+transferred,packet_size-transferred,MSG_NOSIGNAL);
+  if (count<0&&errno==EINTR) continue;
+  if (count<=0) return -1;
+  transferred+=(size_t)count;
+ }
+ // RFCOMM is a byte stream: read the length prefix before collecting the complete reply body.
+ unsigned char length_bytes[2];
+ transferred=0;
+ while (transferred<2)
+ {
+  ssize_t count=recv(*socket_id,length_bytes+transferred,2-transferred,0);
+  if (count<0&&errno==EINTR) continue;
+  if (count<=0) return -1;
+  transferred+=(size_t)count;
+ }
+ size_t response_size=length_bytes[0]+256u*length_bytes[1];
+ // Three reply bytes hold the message ID and status; the rest must match the requested globals.
+ if (response_size!=3+payload_size) return -1;
+ transferred=0;
+ while (transferred<response_size)
+ {
+  ssize_t count=recv(*socket_id,response+transferred,response_size-transferred,0);
+  if (count<0&&errno==EINTR) continue;
+  if (count<=0) return -1;
+  transferred+=(size_t)count;
+ }
+ // Never interpret data from another request or a firmware error as sensor measurements.
+ if (response[0]!=(unsigned char)message_id||response[1]!=(unsigned char)(message_id>>8)||response[2]!=2)
+  return -1;
+ memcpy(payload,response+3,payload_size);
+ return 0;
+}
 
-  /************************************************************************************************************************
-   *   OIPTIONAL TO DO  -   Complete this function
-   ***********************************************************************************************************************/
-  fprintf(stderr,"Calibration function called!\n");  
+static int wait_for_calibration_enter(void)
+{
+ // Consume a whole terminal line so typed text cannot leak into the next colour prompt; return 0 on Enter, -1 on EOF.
+ int character;
+ while ((character=getchar())!=EOF)
+  if (character=='\n') return 0;
+ return -1;
+}
+
+static double colour_means[6][3];             // Ambient-corrected RGB references, cached after loading.
+static double colour_radius_squared[6];      // Squared RGB distance allowed around each reference.
+static const int colour_ids[6]={5,3,2,4,1,6}; // Capture order mapped to the map's colour IDs.
+static int colour_calibration_loaded=0;      // References are usable only after all six files validate.
+static int confirmed_colour=0;               // Last colour confirmed by three consecutive readings.
+static int candidate_colour=0;               // Colour currently accumulating a confirmation streak.
+static int candidate_count=0;                // Consecutive matches, capped at three.
+
+void reset_sensor_color_filter(void)
+{
+ // Discard all temporal history, such as when switching calibration or starting a new scan.
+ confirmed_colour=0;
+ candidate_colour=0;
+ candidate_count=0;
+}
+
+int load_colour_calibration(const char *directory)
+{
+ // Load six 15-sample files once, cache corrected RGB means and rejection radii; return 0 or -1 and reset filter history.
+ const char *colours[]={"red","green","blue","yellow","black","white"};
+ // Build locally and disable classification until the entire replacement model is valid.
+ double means[6][3]={0};
+ colour_calibration_loaded=0;
+ reset_sensor_color_filter();
+ for (int colour_index=0;colour_index<6;colour_index++)
+ {
+  char filename[1024],header[128];
+  int length=snprintf(filename,sizeof(filename),"%s/%s.txt",directory,colours[colour_index]);
+  if (length<0||(size_t)length>=sizeof(filename)) return -1;
+  FILE *input=fopen(filename,"r");
+  if (input==NULL) return -1;
+  if (fgets(header,sizeof(header),input)==NULL||strcmp(header,"sample R G B ambient\n")!=0)
+  {
+   fclose(input);
+   return -1;
+  }
+  // Require all 15 numbered rows; incomplete captures must not silently bias the colour reference.
+  int failed=0;
+  for (int sample=1;sample<=15;sample++)
+  {
+   int index,red,green,blue,ambient;
+   if (fscanf(input,"%d %d %d %d %d",&index,&red,&green,&blue,&ambient)!=5||index!=sample||
+     red<0||red>32767||green<0||green>32767||blue<0||blue>32767||ambient<0||ambient>32767)
+   {
+  failed=1;
+  break;
+   }
+  // Preserve absolute brightness to distinguish black from white; only subtract measured ambient light.
+  means[colour_index][0]+=(red-ambient)/15.0;
+   means[colour_index][1]+=(green-ambient)/15.0;
+   means[colour_index][2]+=(blue-ambient)/15.0;
+  }
+  // Allow trailing whitespace, but reject extra rows or text from an incompatible file format.
+  int character;
+  while (!failed&&(character=fgetc(input))!=EOF)
+   if (!isspace((unsigned char)character)) failed=1;
+  if (ferror(input)) failed=1;
+  fclose(input);
+  if (failed) return -1;
+ }
+ // Derive each acceptance radius from its closest competing colour, not the capture's narrow min/max range.
+ for (int colour_index=0;colour_index<6;colour_index++)
+ {
+  double nearest_squared=1e30;
+  for (int other=0;other<6;other++)
+  {
+   if (other==colour_index) continue;
+   double distance_squared=0;
+   for (int channel=0;channel<3;channel++)
+   {
+  double difference=means[colour_index][channel]-means[other][channel];
+  distance_squared+=difference*difference;
+   }
+   if (distance_squared<nearest_squared) nearest_squared=distance_squared;
+  }
+  // Nearly identical references cannot reliably distinguish their labels.
+  if (nearest_squared<1) return -1;
+  // Radius is 40% of nearest-reference distance (0.4 squared); validate this heuristic with independent captures.
+  colour_radius_squared[colour_index]=0.16*nearest_squared;
+ }
+ memcpy(colour_means,means,sizeof(means));
+ colour_calibration_loaded=1;
+ return 0;
+}
+
+static int classify_sensor_rgb(const int channels[4])
+{
+ // Compare one ambient-corrected sample to cached references; this function performs no file or sensor I/O.
+ if (!colour_calibration_loaded) return 0;
+ int closest=-1;
+ double best_squared=1e30;
+ for (int colour_index=0;colour_index<6;colour_index++)
+ {
+  // Squared Euclidean distance gives the same nearest mean without computing square roots.
+  double distance_squared=0;
+  for (int channel=0;channel<3;channel++)
+  {
+   double difference=channels[channel]-channels[3]-colour_means[colour_index][channel];
+   distance_squared+=difference*difference;
+  }
+  if (distance_squared<best_squared)
+  {
+   best_squared=distance_squared;
+   closest=colour_index;
+  }
+ }
+ // Even an unrelated surface has a nearest reference; reject it unless it is close enough.
+ return best_squared<=colour_radius_squared[closest] ? colour_ids[closest] : 0;
+}
+
+static int update_sensor_color_filter(int colour)
+{
+ // Debounce colour changes across calls: retain the confirmed ID until a new candidate appears three times in a row.
+ if (colour<=0)
+ {
+  // Unknown breaks the streak but holds the confirmed colour; errors also break it and remain visible as -1.
+  candidate_colour=0;
+  candidate_count=0;
+  return colour<0 ? -1 : confirmed_colour;
+ }
+ if (colour!=candidate_colour)
+ {
+  // A different candidate must start its own streak, not inherit matches from the previous colour.
+  candidate_colour=colour;
+  candidate_count=0;
+ }
+ if (candidate_count<3) candidate_count++;
+ if (candidate_count==3) confirmed_colour=colour;
+ return confirmed_colour;
+}
+
+int get_sensor_color_robust(void)
+{
+ // Requires loaded calibration and an open socket; one fresh sample per call returns confirmed ID, initially 0, or -1 on failure.
+ if (!colour_calibration_loaded) return -1;
+ struct timeval timeout={5,0};
+ if (setsockopt(*socket_id,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout))!=0||
+   setsockopt(*socket_id,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout))!=0)
+  return update_sensor_color_filter(-1);
+ // Type 4/mode 5 returns packed 16-bit RGBA within the 12-byte raw reply allocation.
+ unsigned char operations[]={opINPUT_DEVICE,READY_RAW,0,COLOUR_SENSOR_PORT,4,5,3,0x60,0x64,0x68};
+ unsigned char payload[12];
+ if (calibration_command(operations,sizeof(operations),payload,sizeof(payload))!=0)
+  return update_sensor_color_filter(-1);
+ int channels[4];
+ // Negative signed channel values indicate invalid data, not a colour transition worth confirming.
+ for (int channel=0;channel<4;channel++)
+ {
+  int value=payload[2*channel]+256*payload[2*channel+1];
+  if (value>=32768) return update_sensor_color_filter(0);
+  channels[channel]=value;
+ }
+ return update_sensor_color_filter(classify_sensor_rgb(channels));
+}
+
+int calibrate_sensor(void)
+{
+ // On an open NXT connection, prompt for six colours and save 15 unprocessed RGBA samples each to a unique run; return 0 or -1.
+ const char *colours[]={"red","green","blue","yellow","black","white"};
+ struct timeval timeout={5,0};
+ if (setsockopt(*socket_id,SOL_SOCKET,SO_RCVTIMEO,&timeout,sizeof(timeout))!=0||
+     setsockopt(*socket_id,SOL_SOCKET,SO_SNDTIMEO,&timeout,sizeof(timeout))!=0)
+ {
+  perror("Unable to set calibration communication timeout");
+  return -1;
+ }
+ unsigned char identify[]={opINPUT_DEVICE,GET_TYPEMODE,0,COLOUR_SENSOR_PORT,0x60,0x61};
+ unsigned char device[2];
+ if (calibration_command(identify,sizeof(identify),device,2)!=0||device[0]!=4)
+ {
+  fprintf(stderr,"Calibration requires an NXT colour sensor on input %d.\n",COLOUR_SENSOR_PORT+1);
+  return -1;
+ }
+ if (mkdir("calibration",0755)!=0&&errno!=EEXIST)
+ {
+  perror("Unable to create calibration directory");
+  return -1;
+ }
+ // A unique run preserves earlier captures and keeps partial/failed sessions separate from complete ones.
+ char directory[]="calibration/run-XXXXXX";
+ if (mkdtemp(directory)==NULL)
+ {
+  perror("Unable to create calibration session");
+  return -1;
+ }
+ printf("Saving raw calibration readings in %s\n",directory);
+ for (size_t colour_index=0;colour_index<6;colour_index++)
+ {
+  printf("Now reading %s colour: please move the colour sensor over %s and press Enter in this terminal.\n",
+    colours[colour_index],colours[colour_index]);
+  fflush(stdout);
+  if (wait_for_calibration_enter()!=0)
+  {
+   fprintf(stderr,"Terminal input closed; calibration stopped.\n");
+   return -1;
+  }
+  char filename[256];
+  snprintf(filename,sizeof(filename),"%s/%s.txt",directory,colours[colour_index]);
+  FILE *output=fopen(filename,"wx");
+  if (output==NULL) {perror("Unable to create colour file");return -1;}
+  int failed=fprintf(output,"sample R G B ambient\n")<0;
+  // Store uncorrected channels so later processing can change without requiring a new hardware capture.
+  for (int sample=1;sample<=15&&!failed;sample++)
+  {
+   unsigned char operations[]={opINPUT_DEVICE,READY_RAW,0,COLOUR_SENSOR_PORT,4,5,3,0x60,0x64,0x68};
+   unsigned char payload[12];
+   if (calibration_command(operations,sizeof(operations),payload,sizeof(payload))!=0)
+   {
+    fprintf(stderr,"Sensor read failed; %s is incomplete.\n",filename);
+    failed=1;
+    break;
+   }
+   int channels[4];
+   // NXT mode 5 packs four 16-bit channels into the raw payload.
+   for (int channel=0;channel<4;channel++)
+   {
+    int value=payload[2*channel]+256*payload[2*channel+1];
+    channels[channel]=value>=32768 ? value-65536 : value;
+   }
+   failed=fprintf(output,"%d %d %d %d %d\n",sample,channels[0],channels[1],channels[2],channels[3])<0;
+   if (fflush(output)!=0) failed=1;
+   printf("%s %d/15: R=%d G=%d B=%d ambient=%d\n",colours[colour_index],sample,
+     channels[0],channels[1],channels[2],channels[3]);
+   if (sample<15) usleep(100000);
+  }
+  // Signal completion only after all rows have been written and the file has closed successfully.
+  if (fclose(output)!=0) failed=1;
+  if (failed) {fprintf(stderr,"Calibration stopped; check %s.\n",filename);return -1;}
+  if (beep()!=0) {fprintf(stderr,"Completion beep failed.\n");return -1;}
+  printf("Saved 15 readings to %s\n",filename);
+ }
+ printf("Calibration capture complete. No averaging or colour classification applied.\n");
+ return 0;
 }
 
 int parse_map(unsigned char *map_img, int rx, int ry)

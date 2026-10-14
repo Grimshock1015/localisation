@@ -1,6 +1,8 @@
 /EV3_RobotControl/
 /logs/
+/calibration/
 /build/
+/tests/
 a.out
 *.o
 *.d
