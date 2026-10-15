@@ -46,45 +46,11 @@
    location in the map - this is as discussed in lecture.
 
  * Basic robot exploration strategy so the robot can scan different intersections in
-   a sequence that allows it to achieve reliable localization
-   
- * Basic path planning - once the robot has found its location, it must drive toward a 
-   user-specified position somewhere in the map.
-
- --- OPTIONALLY but strongly recommended ---
- 
-  The starter code provides a skeleton for implementing a sensor calibration routine,
- it is called when the code receives -1  -1 as target coordinates. The goal of this
- function should be to gather informatin about what the sensor reads for different
- colours under the particular map/room illumination/battery level conditions you are
- working on - it's entirely up to you how you want to do this, but note that careful
- calibration would make your work much easier, by allowing your robot to more
- robustly (and with fewer mistakes) interpret the sensor data into colours. 
- 
-   --> The code will exit after calibration without running localization (no target!)
-       SO - your calibration code must *save* the calibration information into a
-            file, and you have to add code to main() to read and use this
-            calibration data yourselves.
-   
- What you need to understand thoroughly in order to complete this project:
- 
- * The histogram localization method as discussed in lecture. The general steps of
-   probabilistic robot localization.
-
- * Sensors and signal management - your colour readings will be noisy and unreliable,
-   you have to handle this smartly
-   
- * Robot control with feedback - your robot does not perform exact motions, you can
-   assume there will be error and drift, your code has to handle this.
-   
- * The robot control API you will use to get your robot to move, and to acquire 
-   sensor data. Please see the API directory and read through the header files and
-   attached documentation
-   
- Starter code:
- F. Estrada, 2018 - for CSC C85 
- 
-*/
+ * a sequence that allows reliable localization.
+ *
+ * This source keeps the assignment's map parser and localization interfaces while
+ * adding incremental EV3 robot control and sensor handling.
+ */
 
 #include "EV3_Localization.h"
 #include <time.h>
@@ -94,115 +60,83 @@ static int verify_nxt_colour_sensor(void);
 static int align_to_street(void);
 static long elapsed_ms(const struct timespec *start);
 static int follow_black_street(void);
-#define SENSOR_TO_AXLE_OFFSET_REV 0.25
-#define ALIGN_SWEEP_STEP_DEGREES 5
+static int wiggle_to_black(void);
+static int sample_alignment_colour(void);
+static int read_wheel_degrees(int *right,int *left);
+static int continuous_black_sweep(int *readings,int sample_count,int *final_angle);
+static int continuous_recovery_sweep(void);
+static MoveResult turn_in_place_alignment(int angle_degrees,int turn_direction,int timeout_ms);
+
+#define SENSOR_TO_AXLE_OFFSET_REV 0.27
+#define ALIGNMENT_AXIS_ADVANCE_REV SENSOR_TO_AXLE_OFFSET_REV
+#define ALIGN_SWEEP_STEP_DEGREES 10
 #define ALIGN_SWEEP_TOTAL_DEGREES 360
 #define ALIGN_OPPOSITE_TOLERANCE_DEGREES 35
-#define ALIGN_SWEEP_POWER 11
+#define ALIGN_SWEEP_POWER 15
 #define ALIGN_SWEEP_TIMEOUT_MS 60000
-#define RECOVERY_SWEEP_RIGHT_DEGREES 30
-#define RECOVERY_SWEEP_LEFT_DEGREES 60
+#define ALIGN_TURN_MIN_POWER 15
+#define ALIGN_TURN_MAX_POWER 30
+#define RECOVERY_SWEEP_RIGHT_DEGREES 60
+#define RECOVERY_SWEEP_LEFT_DEGREES 120
 #define FIND_STREET_MAX_REV 1.1
 #define FIND_STREET_TIMEOUT_MS 22000
+#define ALIGNMENT_TURN_OVERSHOOT_DEGREES 0
+#define COLOUR_CLASSIFICATION_MAX_DISTANCE_RATIO 0.85
 
-int map[400][4];            // This holds the representation of the map, up to 20x20
-                            // intersections, raster ordered, 4 building colours per
-                            // intersection.
-int sx, sy;                 // Size of the map (number of intersections along x and y)
-double beliefs[400][4];     // Beliefs for each location and motion direction
+int map[400][4];
+int sx,sy;
+double beliefs[400][4];
 
-int main(int argc, char *argv[])
+int main(int argc,char *argv[])
 {
  char mapname[1024];
- int dest_x, dest_y, rx, ry;
+ int dest_x,dest_y,rx,ry;
  unsigned char *map_image;
- 
- memset(&map[0][0],0,400*4*sizeof(int));
+ memset(&map[0][0],0,sizeof(map));
  sx=0;
  sy=0;
- 
+
  if (argc<4)
  {
-  fprintf(stderr,"Usage: EV3_Localization map_name dest_x dest_y calibration_directory\n");
-  fprintf(stderr,"    map_name - should correspond to a properly formatted .ppm map image\n");
-  fprintf(stderr,"    dest_x, dest_y - target location for the bot within the map, -1 -1 calls calibration routine\n");
-  fprintf(stderr,"    calibration_directory - saved colour files to load once for get_sensor_color_robust()\n");
-  fprintf(stderr,"    append --read-colours to monitor the NXT sensor without moving\n");
-  exit(1);
+  fprintf(stderr,"Usage: EV3_Localization map_name dest_x dest_y calibration_directory [--read-colours]\n");
+  fprintf(stderr,"Use -1 -1 for calibration; --read-colours monitors the NXT sensor without movement.\n");
+  return 1;
  }
- strcpy(&mapname[0],argv[1]);
+ snprintf(mapname,sizeof(mapname),"%s",argv[1]);
  dest_x=atoi(argv[2]);
  dest_y=atoi(argv[3]);
 
  if (dest_x==-1&&dest_y==-1)
  {
   if (BT_open(HEXKEY)!=0) return 1;
-  int calibration_status=calibrate_sensor();
+  int status=calibrate_sensor();
   BT_close();
-  return calibration_status==0 ? 0 : 1;
+  return status==0 ? 0 : 1;
  }
-
- if (argc<5)
+ if (argc<5||load_colour_calibration(argv[4])!=0)
  {
-  fprintf(stderr,"Pass a calibration directory to run the street search.\n");
-  return 1;
- }
- if (load_colour_calibration(argv[4])!=0)
- {
-  fprintf(stderr,"Unable to load colour calibration from %s.\n",argv[4]);
+  fprintf(stderr,"Pass a valid NXT calibration directory.\n");
   return 1;
  }
 
- /******************************************************************************************************************
-  * OPTIONAL TO DO: If you added code for sensor calibration, add just below this comment block any code needed to
-  *   read your calibration data for use in your localization code. Skip this if you are not using calibration
-  * ****************************************************************************************************************/
- 
- 
- // Your code for reading any calibration information should not go below this line //
- 
- map_image=readPPMimage(&mapname[0],&rx,&ry);
+ map_image=readPPMimage(mapname,&rx,&ry);
  if (map_image==NULL)
  {
-  fprintf(stderr,"Unable to open specified map image\n");
-  exit(1);
+  fprintf(stderr,"Unable to read map image.\n");
+  return 1;
  }
- 
- if (parse_map(map_image, rx, ry)==0)
- { 
-  fprintf(stderr,"Unable to parse input image map. Make sure the image is properly formatted\n");
-  free(map_image);
-  exit(1);
- }
-
- if (dest_x<0||dest_x>=sx||dest_y<0||dest_y>=sy)
+ if (parse_map(map_image,rx,ry)==0)
  {
-  fprintf(stderr,"Destination location is outside of the map\n");
+  fprintf(stderr,"Unable to parse map image.\n");
   free(map_image);
-  exit(1);
+  return 1;
  }
-
- // Initialize beliefs - uniform probability for each location and direction
- for (int j=0; j<sy; j++)
-  for (int i=0; i<sx; i++)
-  {
-   beliefs[i+(j*sx)][0]=1.0/(double)(sx*sy*4);
-   beliefs[i+(j*sx)][1]=1.0/(double)(sx*sy*4);
-   beliefs[i+(j*sx)][2]=1.0/(double)(sx*sy*4);
-   beliefs[i+(j*sx)][3]=1.0/(double)(sx*sy*4);
-  }
-
- // Open a socket to the EV3 for remote controlling the bot.
  if (BT_open(HEXKEY)!=0)
  {
-  fprintf(stderr,"Unable to open comm socket to the EV3, make sure the EV3 kit is powered on, and that the\n");
-  fprintf(stderr," hex key for the EV3 matches the one in EV3_Localization.h\n");
+  fprintf(stderr,"Unable to open EV3 Bluetooth connection.\n");
   free(map_image);
-  exit(1);
+  return 1;
  }
-
- fprintf(stderr,"All set, ready to go!\n");
-
  if (verify_nxt_colour_sensor()!=0)
  {
   BT_close();
@@ -215,10 +149,8 @@ int main(int argc, char *argv[])
   printf("Reading NXT colours; press Ctrl+C to stop.\n");
   for (;;)
   {
-   int colour=get_sensor_color_robust();
-   if (colour<0)
+   if (get_sensor_color_robust()<0)
    {
-    fprintf(stderr,"NXT colour sensor read failed.\n");
     BT_close();
     free(map_image);
     return 1;
@@ -226,74 +158,74 @@ int main(int argc, char *argv[])
    usleep(200000);
   }
  }
- 
-/*******************************************************************************************************************************
- *
- *  TO DO - Implement the main localization loop, this loop will have the robot explore the map, scanning intersections and
- *          updating beliefs in the beliefs array until a single location/direction is determined to be the correct one.
- * 
- *          The beliefs array contains one row per intersection (recall that the number of intersections in the map_image
- *          is given by sx, sy, and that the map[][] array contains the colour indices of buildings around each intersection.
- *          Indexing into the map[][] and beliefs[][] arrays is by raster order, so for an intersection at i,j (with 0<=i<=sx-1
- *          and 0<=j<=sy-1), index=i+(j*sx)
- *  
- *          In the beliefs[][] array, you need to keep track of 4 values per intersection, these correspond to the belief the
- *          robot is at that specific intersection, moving in one of the 4 possible directions as follows:
- * 
- *          beliefs[i][0] <---- belief the robot is at intersection with index i, facing UP
- *          beliefs[i][1] <---- belief the robot is at intersection with index i, facing RIGHT
- *          beliefs[i][2] <---- belief the robot is at intersection with index i, facing DOWN
- *          beliefs[i][3] <---- belief the robot is at intersection with index i, facing LEFT
- * 
- *          Initially, all of these beliefs have uniform, equal probability. Your robot must scan intersections and update
- *          belief values based on agreement between what the robot sensed, and the colours in the map. 
- * 
- *          You have two main tasks these are organized into two major functions:
- * 
- *          robot_localization()    <---- Runs the localization loop until the robot's location is found
- *          go_to_target()          <---- After localization is achieved, takes the bot to the specified map location
- * 
- *          The target location, read from the command line, is left in dest_x, dest_y
- * 
- *          Here in main(), you have to call these two functions as appropriate. But keep in mind that it is always possible
- *          that even if your bot managed to find its location, it can become lost again while driving to the target
- *          location, or it may be the initial localization was wrong and the robot ends up in an unexpected place - 
- *          a very solid implementation should give your robot the ability to determine it's lost and needs to 
- *          run localization again.
- *
- *******************************************************************************************************************************/  
 
- // HERE - write code to call robot_localization() and go_to_target() as needed, any additional logic required to get the
- //        robot to complete its task should be here.
+ for (int index=0;index<sx*sy;index++)
+  for (int heading=0;heading<4;heading++)
+   beliefs[index][heading]=1.0/(double)(sx*sy*4);
 
-
- int sensor_status=0;
- if (beep()!=0) sensor_status=1;
- else if (!find_street()) sensor_status=1;
- else if (!align_to_street()) sensor_status=1;
- else
- {
-  int drive_status=drive_along_street();
-  if (drive_status==1) printf("Reached the next intersection.\n");
-  else if (drive_status==2)
-  {
-   fprintf(stderr,"Reached the map boundary before an intersection.\n");
-   sensor_status=1;
-  }
-  else sensor_status=1;
- }
- if (beep()!=0) sensor_status=1;
+ fprintf(stderr,"All set, ready to go.\n");
+ int robot_x=-1,robot_y=-1,direction=-1;
+ int status=beep()==0&&robot_localization(&robot_x,&robot_y,&direction);
+ if (status) printf("Exploration skeleton ended; location estimate remains unknown.\n");
+ beep();
  usleep(150000);
- if (beep()!=0) sensor_status=1;
- // Cleanup and exit - DO NOT WRITE ANY CODE BELOW THIS LINE
+ beep();
  BT_close();
  free(map_image);
- exit(sensor_status);
+ return status ? 0 : 1;
+}
+
+static int is_street_marker(MoveResult result)
+{
+ return result.reason==STOP_COLOUR&&(result.colour==1||result.colour==4);
+}
+
+static int circular_angle_distance(int first,int second)
+{
+ int distance=abs(first-second)%360;
+ return distance>180 ? 360-distance : distance;
+}
+
+static int nearest_black_interval_center(const int *readings,int sample_count,int current_angle)
+{
+ int start_index=-1;
+ for (int index=0;index<sample_count;index++)
+  if (readings[index]!=1)
+  {
+   start_index=index;
+   break;
+  }
+ if (start_index<0) return -1;
+
+ int selected_angle=-1;
+ int smallest_correction=361;
+ int offset=1;
+ while (offset<=sample_count)
+ {
+  if (readings[(start_index+offset)%sample_count]!=1)
+  {
+   offset++;
+   continue;
+  }
+  int interval_start=offset;
+  while (offset<=sample_count&&readings[(start_index+offset)%sample_count]==1) offset++;
+  int interval_end=offset-1;
+  int center_index=(start_index+(interval_start+interval_end)/2)%sample_count;
+  int angle=center_index*ALIGN_SWEEP_STEP_DEGREES;
+  int correction=(current_angle%360)-angle;
+  if (correction>180) correction-=360;
+  if (correction< -180) correction+=360;
+  if (abs(correction)<smallest_correction)
+  {
+   smallest_correction=abs(correction);
+   selected_angle=angle;
+  }
+ }
+ return selected_angle;
 }
 
 const char *get_colour_name(int colour)
 {
- // Return a persistent name for map colour IDs; distinguish read errors from unknown colours.
  static const char *const names[]={"unknown","black","blue","green","yellow","red","white"};
  if (colour==-1) return "read error";
  if (colour<0||colour>6) return "unknown";
@@ -306,284 +238,361 @@ int beep(void)
  return BT_play_tone_sequence(tones);
 }
 
-static int is_street_marker(MoveResult result)
-{
- return result.reason==STOP_COLOUR&&(result.colour==1||result.colour==4);
-}
-
-static int sample_stable_colour(void);
-static int sample_alignment_colour(void);
-static int read_wheel_degrees(int *right,int *left);
-static int continuous_black_sweep(int *readings,int sample_count,int *final_angle);
-
-static int circular_angle_distance(int first,int second)
-{
- int distance=abs(first-second)%360;
- return distance>180 ? 360-distance : distance;
-}
-
-static int align_to_street(void)
-{
- int colour=sample_alignment_colour();
- if (colour!=1)
- {
-  fprintf(stderr,"Cannot align: need to start over a confirmed black street, got %s.\n",
-    get_colour_name(colour));
-  return 0;
- }
-
- MoveResult advance=move_forward_until(NULL,0,SENSOR_TO_AXLE_OFFSET_REV,5000);
- if (advance.reason!=STOP_DISTANCE)
- {
-  report_move_result("align: position axle at black point",advance);
-  return 0;
- }
-
- int sample_count=ALIGN_SWEEP_TOTAL_DEGREES/ALIGN_SWEEP_STEP_DEGREES;
- int readings[ALIGN_SWEEP_TOTAL_DEGREES/ALIGN_SWEEP_STEP_DEGREES];
- int final_sweep_angle;
- memset(readings,0,sizeof(readings));
- printf("Sweeping continuously at %d%% power; sampling about every %d degrees.\n",
-        ALIGN_SWEEP_POWER,ALIGN_SWEEP_STEP_DEGREES);
- if (continuous_black_sweep(readings,sample_count,&final_sweep_angle)!=0) return 0;
-
- // Bridge short unknown-only gaps, but never cross a positively observed non-black colour.
- for (int index=0;index<sample_count;index++)
- {
-  if (readings[index]!=0) continue;
-  int gap=0;
-  while (gap<3&&readings[(index+gap)%sample_count]==0) gap++;
-  if (gap<=2&&readings[(index+sample_count-1)%sample_count]==1&&
-      readings[(index+gap)%sample_count]==1)
-   for (int fill=0;fill<gap;fill++) readings[(index+fill)%sample_count]=1;
- }
-
- int interval_centers[ALIGN_SWEEP_TOTAL_DEGREES/2];
- int interval_count=0;
- int start_index=-1;
- for (int index=0;index<sample_count;index++)
-  if (readings[index]!=1)
-  {
-   start_index=index;
-   break;
-  }
- if (start_index<0)
- {
-  fprintf(stderr,"Sensor read black throughout the full turn; cannot identify a line direction.\n");
-  return 0;
- }
-
- int offset=1;
- while (offset<=sample_count)
- {
-  int index=(start_index+offset)%sample_count;
-  if (readings[index]!=1)
-  {
-   offset++;
-   continue;
-  }
-  int interval_start=offset;
-  while (offset<=sample_count&&readings[(start_index+offset)%sample_count]==1) offset++;
-  int interval_end=offset-1;
-  if (interval_count<(int)(sizeof(interval_centers)/sizeof(interval_centers[0])))
-  {
-   int center_index=(interval_start+interval_end)/2;
-  int sample_index=(start_index+center_index)%sample_count;
-  interval_centers[interval_count++]=sample_index*ALIGN_SWEEP_STEP_DEGREES;
-  }
- }
-
- int selected_angle=-1;
- int best_rotation=361;
- int best_pair_error=ALIGN_OPPOSITE_TOLERANCE_DEGREES+1;
- for (int first=0;first<interval_count;first++)
-  for (int second=first+1;second<interval_count;second++)
-  {
-   int separation=circular_angle_distance(interval_centers[first],interval_centers[second]);
-   int pair_error=abs(separation-180);
-   if (pair_error>ALIGN_OPPOSITE_TOLERANCE_DEGREES) continue;
-  int first_rotation=interval_centers[first]-(final_sweep_angle%360);
-  int second_rotation=interval_centers[second]-(final_sweep_angle%360);
-  if (first_rotation>180) first_rotation-=360;
-  if (first_rotation< -180) first_rotation+=360;
-  if (second_rotation>180) second_rotation-=360;
-  if (second_rotation< -180) second_rotation+=360;
-  int candidate=abs(first_rotation)<=abs(second_rotation) ? first_rotation : second_rotation;
-  if (pair_error<best_pair_error||(pair_error==best_pair_error&&abs(candidate)<best_rotation))
-  {
-    selected_angle=candidate;
-    best_rotation=abs(candidate);
-   best_pair_error=pair_error;
-   }
-  }
- if (selected_angle<0&&best_rotation==361)
- {
-  fprintf(stderr,"No pair of black intervals approximately 180 degrees apart was found.\n");
-  return 0;
- }
-
- if (selected_angle!=0)
- {
-  int turn_direction=selected_angle>0 ? 0 : 1;
-  MoveResult center=turn_in_place(abs(selected_angle),turn_direction,15000);
-  if (center.reason!=STOP_ANGLE)
-  {
-   report_move_result("align: return to street heading",center);
-   return 0;
-  }
- }
- colour=sample_alignment_colour();
- if (colour!=1)
- {
-  int found_black=0;
-  for (int direction=0;direction<=1&&!found_black;direction++)
-  {
-   printf("Selected heading reads %s; checking %s side in 5-degree increments.\n",
-          get_colour_name(colour),direction==0 ? "right" : "left");
-   for (int step=1;step<=3;step++)
-   {
-    MoveResult nudge=turn_in_place(5,direction,5000);
-    if (nudge.reason!=STOP_ANGLE)
-    {
-     report_move_result("align: fine black acquisition",nudge);
-     return 0;
-    }
-    colour=sample_alignment_colour();
-    if (colour==1)
-    {
-     found_black=1;
-     break;
-    }
-   }
-   if (!found_black&&direction==0)
-   {
-    MoveResult restore=turn_in_place(15,1,10000);
-    if (restore.reason!=STOP_ANGLE)
-    {
-     report_move_result("align: restore selected heading",restore);
-     return 0;
-    }
-   }
-  }
-  if (!found_black)
-  {
-   fprintf(stderr,"Black was not reacquired within 15 degrees of the selected interval center.\n");
-   return 0;
-  }
- }
- int angle,rate;
- if (BT_read_gyro(GYRO_SENSOR_PORT,1,&angle,&rate)!=1) return 0;
- printf("Opposite black intervals verified; centered on street and gyro reset.\n");
- return 1;
-}
-
-static int turn_at_red_and_search(const int *stop_colours)
-{
- const int street_colours[]={1,4};
- MoveResult result=turn_in_place_until(180,0,street_colours,2,10000);
- report_move_result("find street: red turnaround",result);
- if (is_street_marker(result)) return 1;
- if (result.reason!=STOP_ANGLE) return -1;
- result=move_forward_until(stop_colours,3,FIND_STREET_MAX_REV,FIND_STREET_TIMEOUT_MS);
- report_move_result("find street: diagonal-cell return",result);
- if (is_street_marker(result)) return 1;
- if (result.reason==STOP_COLOUR) return -1;
- return result.reason==STOP_DISTANCE||result.reason==STOP_TIMEOUT ? 0 : -1;
-}
-
-int find_street(void)   
-{
- /*
-  * This function gets your robot onto a street, wherever it is placed on the map. You can do this in many ways, but think
-  * about what is the most effective and reliable way to detect a street and stop your robot once it's on it.
-  * 
-  * You can use the return value to indicate success or failure, or to inform the rest of your code of the state of your
-  * bot after calling this function
-  */
- const int stop_colours[]={1,4,5};
- MoveResult result=move_forward_until(stop_colours,3,FIND_STREET_MAX_REV,FIND_STREET_TIMEOUT_MS);
- report_move_result("find street: first diagonal-cell leg",result);
- if (is_street_marker(result)) return 1;
-
- if (result.reason==STOP_COLOUR&&result.colour==5)
- {
-  int recovery=turn_at_red_and_search(stop_colours);
-  return recovery==1;
- }
- if (result.reason==STOP_DISTANCE||result.reason==STOP_TIMEOUT)
-  fprintf(stderr,"No street marker found within one diagonal cell.\n");
- return 0;
-}
-
-int drive_along_street(void)
-{
- /*
-  * This function drives your bot along a street, making sure it stays on the street without straying to other pars of
-  * the map. It stops at an intersection.
-  * 
-  * You can implement this in many ways, including a controlled (PID for example), a neural network trained to track and
-  * follow streets, or a carefully coded process of scanning and moving. It's up to you, feel free to consult your TA
-  * or the course instructor for help carrying out your plan.
-  * 
-  * You can use the return value to indicate success or failure, or to inform the rest of your code of the state of your
-  * bot after calling this function.
-  */
- return follow_black_street();
-}
-
-int scan_intersection(int *tl, int *tr, int *br, int *bl)
-{
- /*
-  * This function carries out the intersection scan - the bot should (obviously) be placed at an intersection for this,
-  * and the specific set of actions will depend on how you designed your bot and its sensor. Whatever the process, you
-  * should make sure the intersection scan is reliable - i.e. the positioning of the sensor is reliably over the buildings
-  * it needs to read, repeatably, and as the robot moves over the map.
-  * 
-  * Use the APIs sensor reading calls to poll the sensors. You need to remember that sensor readings are noisy and 
-  * unreliable so * YOU HAVE TO IMPLEMENT SOME KIND OF SENSOR / SIGNAL MANAGEMENT * to obtain reliable measurements.
-  * 
-  * Recall your lectures on sensor and noise management, and implement a strategy that makes sense. Document your process
-  * in the code below so your TA can quickly understand how it works.
-  * 
-  * Once your bot has read the colours at the intersection, it must return them using the provided pointers to 4 integer
-  * variables:
-  * 
-  * tl - top left building colour
-  * tr - top right building colour
-  * br - bottom right building colour
-  * bl - bottom left building colour
-  * 
-  * The function's return value can be used to indicate success or failure, or to notify your code of the bot's state
-  * after this call.
-  */
- 
-  /************************************************************************************************************************
-   *   TO DO  -   Complete this function
-   ***********************************************************************************************************************/
-
- // Return invalid colour values, and a zero to indicate failure (you will replace this with your code)
- *(tl)=-1;
- *(tr)=-1;
- *(br)=-1;
- *(bl)=-1;
- return(0);
- 
-}
-
 int turn_at_intersection(int turn_direction)
 {
  /*
   * This function is used to have the robot turn either left or right at an intersection (obviously your bot can not just
-  * drive forward!). 
-  * 
+  * drive forward!).
+  *
   * If turn_direction=0, turn right, else if turn_direction=1, turn left.
-  * 
+  *
   * You're free to implement this in any way you like, but it should reliably leave your bot facing the correct direction
-  * and on a street it can follow. 
-  * 
+  * and on a street it can follow.
+  *
   * You can use the return value to indicate success or failure, or to inform your code of the state of the bot
   */
-  return(0);
+  if (turn_direction!=0&&turn_direction!=1) return 0;
+  MoveResult turn=turn_in_place(90,turn_direction,10000);
+  if (turn.reason!=STOP_ANGLE)
+  {
+   report_move_result("intersection turn",turn);
+   return 0;
+  }
+  return 1;
+}
+
+  static int align_to_street(void)
+  {
+   int initial_colour=sample_alignment_colour();
+   if (initial_colour!=1&&initial_colour!=4)
+   {
+    fprintf(stderr,"Cannot align from %s; expected black or yellow.\n",get_colour_name(initial_colour));
+    initial_colour=continuous_recovery_sweep();
+    if (initial_colour!=1&&initial_colour!=4)
+    {
+     fprintf(stderr,"Recovery sweep did not reacquire black or yellow.\n");
+     return 0;
+    }
+   }
+   MoveResult advance=move_forward_until(NULL,0,ALIGNMENT_AXIS_ADVANCE_REV,5000);
+   if (advance.reason!=STOP_DISTANCE)
+   {
+    report_move_result("align: position axle",advance);
+    return 0;
+   }
+
+   const int sample_count=ALIGN_SWEEP_TOTAL_DEGREES/ALIGN_SWEEP_STEP_DEGREES;
+   int readings[ALIGN_SWEEP_TOTAL_DEGREES/ALIGN_SWEEP_STEP_DEGREES]={0};
+   int final_angle;
+   if (continuous_black_sweep(readings,sample_count,&final_angle)!=0) return 0;
+
+   // Fill brief unknown gaps inside yellow sectors, then aim for the widest sector midpoint.
+   for (int index=0;index<sample_count;index++)
+   {
+    if (readings[index]!=0) continue;
+    int gap=0;
+    while (gap<3&&readings[(index+gap)%sample_count]==0) gap++;
+    if (gap<=2&&readings[(index+sample_count-1)%sample_count]==4&&
+        readings[(index+gap)%sample_count]==4)
+     for (int fill=0;fill<gap;fill++) readings[(index+fill)%sample_count]=4;
+   }
+
+   for (int index=0;index<sample_count;index++)
+   {
+    if (readings[index]!=0) continue;
+    int gap=0;
+    while (gap<3&&readings[(index+gap)%sample_count]==0) gap++;
+    if (gap<=2&&readings[(index+sample_count-1)%sample_count]==1&&
+        readings[(index+gap)%sample_count]==1)
+     for (int fill=0;fill<gap;fill++) readings[(index+fill)%sample_count]=1;
+   }
+
+   int target_angle=-1,target_width=0,target_colour=4;
+   for (int index=0;index<sample_count;index++)
+   {
+    int previous=(index+sample_count-1)%sample_count;
+    if (readings[index]!=4||readings[previous]==4) continue;
+    int width=0;
+    while (width<sample_count&&readings[(index+width)%sample_count]==4) width++;
+    if (width<2) continue;
+    if (width>target_width)
+    {
+     target_width=width;
+     target_angle=((index+(width-1)/2)%sample_count)*ALIGN_SWEEP_STEP_DEGREES;
+    }
+   }
+
+   if (target_angle<0)
+   {
+    target_colour=1;
+    int start_index=-1;
+    for (int index=0;index<sample_count;index++)
+    {
+     if (readings[index]!=1)
+     {
+      start_index=index;
+      break;
+     }
+    }
+    int nearest_error=361;
+    if (start_index>=0)
+    {
+     int offset=1;
+     while (offset<=sample_count)
+     {
+      if (readings[(start_index+offset)%sample_count]!=1)
+      {
+       offset++;
+       continue;
+      }
+      int interval_start=offset;
+      while (offset<=sample_count&&readings[(start_index+offset)%sample_count]==1) offset++;
+      int interval_end=offset-1;
+      int center_index=(start_index+(interval_start+interval_end)/2)%sample_count;
+      int angle=center_index*ALIGN_SWEEP_STEP_DEGREES;
+      int error=angle-(final_angle%360);
+      if (error>180) error-=360;
+      if (error< -180) error+=360;
+      if (abs(error)<nearest_error)
+      {
+       nearest_error=abs(error);
+       target_angle=angle;
+      }
+     }
+    }
+   }
+   if (target_angle<0)
+   {
+    fprintf(stderr,"Alignment sweep found neither a yellow sector nor black road.\n");
+    return 0;
+   }
+
+     int current_angle=final_angle%360;
+     int correction=current_angle-target_angle;
+     if (correction>180) correction-=360;
+     if (correction< -180) correction+=360;
+     int turn_direction=correction>=0 ? 1 : 0;
+     printf("Alignment target %s at %d degrees; turning %s by %d degrees.\n",
+       get_colour_name(target_colour),target_angle,
+       turn_direction==1 ? "counterclockwise" : "clockwise",abs(correction));
+     if (correction!=0)
+   {
+      int commanded=abs(correction)+ALIGNMENT_TURN_OVERSHOOT_DEGREES;
+      if (commanded>360) commanded=360;
+      MoveResult center=turn_in_place_alignment(commanded,turn_direction,30000);
+    if (center.reason!=STOP_ANGLE)
+    {
+     report_move_result("align: turn to target sector",center);
+     return 0;
+    }
+   }
+   int verified=sample_alignment_colour();
+   if (verified!=target_colour)
+   {
+    fprintf(stderr,"Alignment target was %s, but final reading is %s.\n",
+       get_colour_name(target_colour),get_colour_name(verified));
+    int recovered=continuous_recovery_sweep();
+    if (recovered!=target_colour)
+    {
+     fprintf(stderr,"Alignment recovery found %s instead of %s.\n",
+       get_colour_name(recovered),get_colour_name(target_colour));
+     return 0;
+    }
+    printf("Recovery sweep reacquired the %s alignment target.\n",get_colour_name(target_colour));
+   }
+   int gyro_angle,gyro_rate;
+   if (BT_read_gyro(GYRO_SENSOR_PORT,1,&gyro_angle,&gyro_rate)!=1) return 0;
+   printf("Aligned to %s sector center at sweep angle %d degrees; gyro reset.\n",
+     get_colour_name(target_colour),target_angle);
+   return 1;
+  }
+
+  static int turn_at_red_and_search(const int *stop_colours)
+  {
+   const int road_markers[]={1,4};
+   MoveResult turn=turn_in_place_until(180,0,road_markers,2,15000);
+  if (turn.reason==STOP_COLOUR&&(turn.colour==1||turn.colour==4)) return 1;
+   if (turn.reason!=STOP_ANGLE) return 0;
+   MoveResult search=move_forward_until(stop_colours,3,FIND_STREET_MAX_REV,FIND_STREET_TIMEOUT_MS);
+  if (is_street_marker(search)) return 1;
+  if (search.reason!=STOP_DISTANCE&&search.reason!=STOP_TIMEOUT) return 0;
+  int recovered=continuous_recovery_sweep();
+  return recovered==1||recovered==4;
+  }
+
+  int find_street(void)
+  {
+   const int stop_colours[]={1,4,5};
+   MoveResult result=move_forward_until(stop_colours,3,FIND_STREET_MAX_REV,FIND_STREET_TIMEOUT_MS);
+   report_move_result("find street",result);
+   if (is_street_marker(result)) return 1;
+   if (result.reason==STOP_COLOUR&&result.colour==5) return turn_at_red_and_search(stop_colours);
+  if (result.reason!=STOP_DISTANCE&&result.reason!=STOP_TIMEOUT) return 0;
+   fprintf(stderr,"No road or intersection found within the bounded search.\n");
+  int recovered=continuous_recovery_sweep();
+  if (recovered==1||recovered==4) return 1;
+  if (recovered==5) return turn_at_red_and_search(stop_colours);
+  return 0;
+  }
+
+  int drive_along_street(void)
+  {
+   return follow_black_street();
+  }
+
+  int scan_intersection(int *tl,int *tr,int *br,int *bl)
+  {
+   if (tl==NULL||tr==NULL||br==NULL||bl==NULL) return 0;
+   *tl=*tr=*br=*bl=-1;
+   int initial_colour=sample_alignment_colour();
+   if (initial_colour!=4)
+   {
+    fprintf(stderr,"Intersection scan expected yellow, got %s; starting recovery sweep.\n",
+      get_colour_name(initial_colour));
+    if (continuous_recovery_sweep()!=4)
+    {
+     fprintf(stderr,"Recovery sweep did not reacquire yellow.\n");
+     return 0;
+    }
+   }
+   MoveResult advance=move_forward_until(NULL,0,ALIGNMENT_AXIS_ADVANCE_REV,5000);
+   if (advance.reason!=STOP_DISTANCE)
+   {
+    report_move_result("intersection scan: position axle",advance);
+    return 0;
+   }
+   int gyro_angle,gyro_rate;
+   if (BT_read_gyro(GYRO_SENSOR_PORT,1,&gyro_angle,&gyro_rate)!=1) return 0;
+   const int sample_count=ALIGN_SWEEP_TOTAL_DEGREES/ALIGN_SWEEP_STEP_DEGREES;
+   int readings[ALIGN_SWEEP_TOTAL_DEGREES/ALIGN_SWEEP_STEP_DEGREES]={0};
+   int final_angle;
+   if (continuous_black_sweep(readings,sample_count,&final_angle)!=0) return 0;
+   const int headings[]={315,45,135,225};
+   const char *labels[]={"TL","TR","BR","BL"};
+   int *outputs[]={tl,tr,br,bl};
+   int success=1;
+   for (int corner=0;corner<4;corner++)
+   {
+    int counts[7]={0};
+    for (int index=0;index<sample_count;index++)
+     if (circular_angle_distance(index*ALIGN_SWEEP_STEP_DEGREES,headings[corner])<=25&&
+    readings[index]>=1&&readings[index]<=6) counts[readings[index]]++;
+    int selected=0,selected_count=0,runner_up=0;
+    for (int colour=2;colour<=6;colour++)
+    {
+     if (colour==4||colour==5) continue;
+     if (counts[colour]>selected_count)
+     {
+      runner_up=selected_count;
+      selected=colour;
+      selected_count=counts[colour];
+     }
+     else if (counts[colour]>runner_up) runner_up=counts[colour];
+    }
+    printf("Intersection %s at %d degrees: %s (%d/sector)\n",labels[corner],
+      headings[corner],get_colour_name(selected),selected_count);
+    if (selected_count<2||selected_count==runner_up) success=0;
+    else *outputs[corner]=selected;
+   }
+   int black_angle=nearest_black_interval_center(readings,sample_count,final_angle);
+   if (black_angle>=0)
+   {
+    int correction=(final_angle%360)-black_angle;
+    if (correction>180) correction-=360;
+    if (correction< -180) correction+=360;
+    printf("Returning to nearest recorded black road at %d degrees by %d degrees.\n",
+      black_angle,abs(correction));
+    if (correction!=0)
+    {
+     int turn_direction=correction>=0 ? 1 : 0;
+     MoveResult turn=turn_in_place_alignment(abs(correction),turn_direction,15000);
+     if (turn.reason!=STOP_ANGLE)
+     {
+      report_move_result("intersection scan: return to recorded black",turn);
+      return 0;
+     }
+    }
+   }
+   else
+    printf("No black interval recorded; using bounded black-road wiggle.\n");
+   if (!wiggle_to_black()) return 0;
+   if (BT_read_gyro(GYRO_SENSOR_PORT,1,&gyro_angle,&gyro_rate)!=1) return 0;
+   printf("Intersection relative readings: TL=%s TR=%s BL=%s BR=%s; gyro zero reset.\n",
+     get_colour_name(*tl),get_colour_name(*tr),get_colour_name(*bl),get_colour_name(*br));
+   return success;
+  }
+
+static int recover_from_red_boundary(void)
+{
+ printf("Red boundary: turning around, reacquiring the street, and realigning.\n");
+ MoveResult turn=turn_in_place(180,0,15000);
+ if (turn.reason!=STOP_ANGLE)
+ {
+  report_move_result("boundary turnaround",turn);
+  return 0;
+ }
+ return find_street()&&align_to_street();
+}
+
+static int drive_to_next_intersection(int *direction)
+{
+ for (int attempt=0;attempt<2;attempt++)
+ {
+  int status=drive_along_street();
+  if (status==1) return 1;
+  if (status!=2)
+  {
+   fprintf(stderr,"Street following failed before reaching an intersection.\n");
+   return 0;
+  }
+  if (attempt==1||!recover_from_red_boundary())
+  {
+   fprintf(stderr,"Could not recover from the red boundary.\n");
+   return 0;
+  }
+  *direction=(*direction+2)%4;
+ }
+ return 0;
+}
+
+static int wiggle_to_black(void)
+{
+ int colour=sample_alignment_colour();
+ if (colour<0) return 0;
+ if (colour==1)
+ {
+  printf("Already aligned with black road.\n");
+  return 1;
+ }
+
+ printf("Wiggling to reacquire black road: left %d degrees, then right %d degrees.\n",
+   RECOVERY_SWEEP_RIGHT_DEGREES,RECOVERY_SWEEP_LEFT_DEGREES);
+ int aligned=0;
+ for (int turned=0;turned<RECOVERY_SWEEP_RIGHT_DEGREES&&!aligned;turned+=ALIGN_SWEEP_STEP_DEGREES)
+ {
+  MoveResult turn=turn_in_place(ALIGN_SWEEP_STEP_DEGREES,1,5000);
+  if (turn.reason!=STOP_ANGLE) return 0;
+  colour=sample_alignment_colour();
+  if (colour<0) return 0;
+  aligned=colour==1;
+ }
+ for (int turned=0;turned<RECOVERY_SWEEP_LEFT_DEGREES&&!aligned;turned+=ALIGN_SWEEP_STEP_DEGREES)
+ {
+  MoveResult turn=turn_in_place(ALIGN_SWEEP_STEP_DEGREES,0,5000);
+  if (turn.reason!=STOP_ANGLE) return 0;
+  colour=sample_alignment_colour();
+  if (colour<0) return 0;
+  aligned=colour==1;
+ }
+ if (!aligned)
+ {
+  fprintf(stderr,"Wiggle did not reacquire black road.\n");
+  return 0;
+ }
+ int angle,rate;
+ if (BT_read_gyro(GYRO_SENSOR_PORT,1,&angle,&rate)!=1) return 0;
+ printf("Black road reacquired; gyro reference reset.\n");
+ return 1;
 }
 
 int robot_localization(int *robot_x, int *robot_y, int *direction)
@@ -639,12 +648,44 @@ int robot_localization(int *robot_x, int *robot_y, int *direction)
    *   TO DO  -   Complete this function
    ***********************************************************************************************************************/
 
- // Return an invalid location/direction and notify that localization was unsuccessful (you will delete this and replace it
- // with your code).
- *(robot_x)=-1;
- *(robot_y)=-1;
- *(direction)=-1;
- return(0);
+ if (robot_x==NULL||robot_y==NULL||direction==NULL) return 0;
+ *robot_x=-1;
+ *robot_y=-1;
+ *direction=0;
+
+ if (!find_street()||!align_to_street()) return 0;
+ *direction=0;
+ if (!drive_to_next_intersection(direction)) return 0;
+ printf("First yellow intersection establishes relative orientation 0.\n");
+
+ for (int intersection=0;intersection<4;intersection++)
+ {
+  int tl,tr,br,bl;
+  if (!scan_intersection(&tl,&tr,&br,&bl)) return 0;
+  printf("Intersection %d relative readings: TL=%s TR=%s BL=%s BR=%s\n",
+    intersection+1,get_colour_name(tl),get_colour_name(tr),
+    get_colour_name(bl),get_colour_name(br));
+
+  if (intersection==3) break;
+
+  int turn_direction=intersection==0 ? 0 : intersection==1 ? 1 : -1;
+  if (turn_direction==0) printf("Route step: turn right at intersection 1.\n");
+  else if (turn_direction==1) printf("Route step: turn left at intersection 2.\n");
+  else printf("Route step: continue straight at intersection 3.\n");
+
+  if (!wiggle_to_black()) return 0;
+  if (turn_direction>=0)
+  {
+   if (!turn_at_intersection(turn_direction)) return 0;
+   *direction=(*direction+(turn_direction==0 ? 1 : 3))%4;
+   if (!wiggle_to_black()) return 0;
+  }
+  if (!drive_to_next_intersection(direction)) return 0;
+ }
+
+ printf("Visited four intersections: right, left, straight; stopping at intersection 4.\n");
+ printf("Bayesian localization is not implemented yet.\n");
+ return 1;
 }
 
 int go_to_target(int robot_x, int robot_y, int direction, int target_x, int target_y)
@@ -812,25 +853,39 @@ int load_colour_calibration(const char *directory)
 
 static int classify_sensor_rgb(const int channels[3])
 {
- // Choose the nearest captured NXT RGB sample, which uses the current room and sensor mounting calibration.
+ // Require a clear nearest-class margin; ambiguous RGB values stay unknown instead of crossing colour boundaries.
  if (!colour_calibration_loaded) return 0;
- double nearest_distance=HUGE_VAL;
- int nearest_colour=0;
+ double colour_distances[7];
+ for (int colour=0;colour<7;colour++) colour_distances[colour]=HUGE_VAL;
  for (int colour_index=0;colour_index<6;colour_index++)
   for (int sample=0;sample<CALIBRATION_SAMPLES_PER_COLOUR;sample++)
- {
+  {
    double distance=0;
    for (int channel=0;channel<3;channel++)
    {
     double difference=(double)channels[channel]-colour_calibration_samples[colour_index][sample][channel];
     distance+=difference*difference;
    }
-   if (distance<nearest_distance)
+   int colour=calibration_map_ids[colour_index];
+   if (distance<colour_distances[colour]) colour_distances[colour]=distance;
+  }
+
+ double nearest_distance=HUGE_VAL,second_distance=HUGE_VAL;
+ int nearest_colour=0;
+ for (int colour=1;colour<=6;colour++)
+ {
+  if (colour_distances[colour]<nearest_distance)
    {
-    nearest_distance=distance;
-    nearest_colour=calibration_map_ids[colour_index];
+   second_distance=nearest_distance;
+   nearest_distance=colour_distances[colour];
+   nearest_colour=colour;
+   }
+  else if (colour_distances[colour]<second_distance)
+   {
+   second_distance=colour_distances[colour];
    }
  }
+ if (nearest_distance>=second_distance*COLOUR_CLASSIFICATION_MAX_DISTANCE_RATIO) return 0;
  return nearest_colour;
 }
 
@@ -868,6 +923,24 @@ static int sample_colour_agreement(int required_votes)
 static int sample_stable_colour(void)
 {
  return sample_colour_agreement(3);
+}
+
+static int sample_street_event_colour(void)
+{
+ int colour=sample_colour_agreement(4);
+ if (colour<0) return -1;
+ if (colour==5)
+ {
+  int confirmation=sample_colour_agreement(4);
+  if (confirmation!=5)
+  {
+   printf("Red boundary vote was not confirmed; treating it as unknown.\n");
+   colour=0;
+  }
+ }
+ printf("Street sample: %s (%d)\n",get_colour_name(colour),colour);
+ fflush(stdout);
+ return colour;
 }
 
 static int sample_alignment_colour(void)
@@ -927,12 +1000,30 @@ static int continuous_black_sweep(int *readings,int sample_count,int *final_angl
 
  if (BT_motor_port_stop(MOTOR_B|MOTOR_C,1)!=0) return -1;
  if (BT_read_gyro(GYRO_SENSOR_PORT,0,&angle,&rate)!=1) return -1;
- *final_angle=angle;
  if (read_error||angle<ALIGN_SWEEP_TOTAL_DEGREES-ALIGN_SWEEP_STEP_DEGREES)
  {
   fprintf(stderr,"Alignment sweep ended at %d degrees, before a complete turn.\n",angle);
   return -1;
  }
+ int overshoot=angle-ALIGN_SWEEP_TOTAL_DEGREES;
+ if (overshoot>3)
+ {
+  if (overshoot>45)
+  {
+   fprintf(stderr,"Alignment sweep overshot by %d degrees; refusing a large correction.\n",overshoot);
+   return -1;
+  }
+  printf("Sweep overshot by %d degrees; correcting back to 360.\n",overshoot);
+  MoveResult correction=turn_in_place(overshoot,1,10000);
+  if (correction.reason!=STOP_ANGLE)
+  {
+   report_move_result("alignment sweep overshoot correction",correction);
+   return -1;
+  }
+  *final_angle=ALIGN_SWEEP_TOTAL_DEGREES;
+ }
+ else
+  *final_angle=angle;
  return 0;
 }
 
@@ -1175,7 +1266,9 @@ static MoveResult drive_straight(int direction,const int *stop_colours,int colou
  }
 }
 
-static MoveResult rotate_gyro(int wheels,int turn_right,int angle_degrees,const int *stop_colours,int colour_count,int timeout_ms)
+static MoveResult rotate_gyro_with_power_limits(int wheels,int turn_right,int angle_degrees,
+                                                const int *stop_colours,int colour_count,
+                                                int timeout_ms,int min_power,int max_power)
 {
  MoveResult failed={STOP_ERROR,0};
  if (angle_degrees<1||angle_degrees>360||movement_setup(stop_colours,colour_count)!=0) return failed;
@@ -1210,9 +1303,9 @@ static MoveResult rotate_gyro(int wheels,int turn_right,int angle_degrees,const 
   }
   // Power tapers with the remaining error; a negative error (overshoot) reverses the wheels to correct.
   int magnitude=(int)(TURN_GAIN*abs(error));
-  int ceiling=elapsed>=MOVE_RAMP_UP_MS ? TURN_MAX_POWER :
-    TURN_MIN_POWER+(TURN_MAX_POWER-TURN_MIN_POWER)*elapsed/MOVE_RAMP_UP_MS;
-  if (magnitude<TURN_MIN_POWER) magnitude=TURN_MIN_POWER;
+  int ceiling=elapsed>=MOVE_RAMP_UP_MS ? max_power :
+    min_power+(max_power-min_power)*elapsed/MOVE_RAMP_UP_MS;
+  if (magnitude<min_power) magnitude=min_power;
   if (magnitude>ceiling) magnitude=ceiling;
   int direction=error>0 ? 1 : -1;
   // Clockwise = left wheel forward and/or right wheel backward.
@@ -1220,6 +1313,13 @@ static MoveResult rotate_gyro(int wheels,int turn_right,int angle_degrees,const 
   int right=wheels!=ROTATE_LEFT_WHEEL ? -direction*magnitude : 0;
   if (BT_turn(MOTOR_C,left,MOTOR_B,right)!=0) return stop_with(STOP_ERROR,0);
  }
+}
+
+static MoveResult rotate_gyro(int wheels,int turn_right,int angle_degrees,const int *stop_colours,
+                              int colour_count,int timeout_ms)
+{
+ return rotate_gyro_with_power_limits(wheels,turn_right,angle_degrees,stop_colours,colour_count,
+                                      timeout_ms,TURN_MIN_POWER,TURN_MAX_POWER);
 }
 
 MoveResult move_forward_until(const int *stop_colours,int colour_count,double max_revolutions,int timeout_ms)
@@ -1249,6 +1349,14 @@ MoveResult turn_in_place(int angle_degrees,int turn_direction,int timeout_ms)
  return rotate_gyro(ROTATE_BOTH,turn_direction==0,angle_degrees,NULL,0,timeout_ms);
 }
 
+static MoveResult turn_in_place_alignment(int angle_degrees,int turn_direction,int timeout_ms)
+{
+ MoveResult failed={STOP_ERROR,0};
+ if (turn_direction!=0&&turn_direction!=1) return failed;
+ return rotate_gyro_with_power_limits(ROTATE_BOTH,turn_direction==0,angle_degrees,NULL,0,
+                                      timeout_ms,ALIGN_TURN_MIN_POWER,ALIGN_TURN_MAX_POWER);
+}
+
 MoveResult turn_in_place_until(int angle_degrees,int turn_direction,const int *stop_colours,int colour_count,int timeout_ms)
 {
  MoveResult failed={STOP_ERROR,0};
@@ -1272,67 +1380,68 @@ int report_move_result(const char *label,MoveResult result)
 
 static int continuous_recovery_sweep(void)
 {
- int angle,rate;
- int left_limit=RECOVERY_SWEEP_RIGHT_DEGREES-RECOVERY_SWEEP_LEFT_DEGREES;
- if (BT_read_gyro(GYRO_SENSOR_PORT,1,&angle,&rate)!=1) return -1;
  int colour=sample_alignment_colour();
- if (colour==1) return 1;
+ if (colour==5)
+ {
+  int confirmation=sample_alignment_colour();
+  if (confirmation!=5) colour=confirmation==1||confirmation==4 ? confirmation : 0;
+ }
+ if (colour==1||colour==4||colour==5) return colour;
  if (colour<0) return -1;
- struct timespec start;
- clock_gettime(CLOCK_MONOTONIC,&start);
 
- if (BT_turn(MOTOR_C,ALIGN_SWEEP_POWER,MOTOR_B,-ALIGN_SWEEP_POWER)!=0)
+ printf("Wiggle search: left %d degrees, then right %d degrees.\n",
+        RECOVERY_SWEEP_RIGHT_DEGREES,RECOVERY_SWEEP_LEFT_DEGREES);
+ int turned_left=0;
+ while (turned_left<RECOVERY_SWEEP_RIGHT_DEGREES)
  {
-  BT_motor_port_stop(MOTOR_B|MOTOR_C,1);
-  return -1;
- }
- int next_angle=ALIGN_SWEEP_STEP_DEGREES;
- while (next_angle<=RECOVERY_SWEEP_RIGHT_DEGREES)
- {
-  if (elapsed_ms(&start)>=30000||BT_read_gyro(GYRO_SENSOR_PORT,0,&angle,&rate)!=1) goto fail;
-  if (angle<next_angle) continue;
+  MoveResult turn=turn_in_place(ALIGN_SWEEP_STEP_DEGREES,1,5000);
+  if (turn.reason!=STOP_ANGLE) return -1;
+  turned_left+=ALIGN_SWEEP_STEP_DEGREES;
   colour=sample_alignment_colour();
-  if (colour<0||BT_read_gyro(GYRO_SENSOR_PORT,0,&angle,&rate)!=1) goto fail;
-  printf("Recovery sweep right: gyro %d, %s (%d)\n",angle,get_colour_name(colour),colour);
-  fflush(stdout);
-  if (colour==1)
+  if (colour==5)
   {
-   if (BT_motor_port_stop(MOTOR_B|MOTOR_C,1)!=0) return -1;
-   return 1;
+   int confirmation=sample_alignment_colour();
+   if (confirmation!=5) colour=confirmation==1||confirmation==4 ? confirmation : 0;
   }
-  next_angle=(angle/ALIGN_SWEEP_STEP_DEGREES+1)*ALIGN_SWEEP_STEP_DEGREES;
+  if (colour<0) return -1;
+  printf("Wiggle left %d: %s (%d)\n",turned_left,get_colour_name(colour),colour);
+  if (colour==1||colour==4||colour==5) return colour;
  }
 
- if (BT_turn(MOTOR_C,-ALIGN_SWEEP_POWER,MOTOR_B,ALIGN_SWEEP_POWER)!=0) goto fail;
- next_angle=RECOVERY_SWEEP_RIGHT_DEGREES-ALIGN_SWEEP_STEP_DEGREES;
- while (next_angle>=left_limit)
+ int turned_right=0;
+ while (turned_right<RECOVERY_SWEEP_LEFT_DEGREES)
  {
-  if (elapsed_ms(&start)>=30000||BT_read_gyro(GYRO_SENSOR_PORT,0,&angle,&rate)!=1) goto fail;
-  if (angle>next_angle) continue;
+  MoveResult turn=turn_in_place(ALIGN_SWEEP_STEP_DEGREES,0,5000);
+  if (turn.reason!=STOP_ANGLE) return -1;
+  turned_right+=ALIGN_SWEEP_STEP_DEGREES;
   colour=sample_alignment_colour();
-  if (colour<0||BT_read_gyro(GYRO_SENSOR_PORT,0,&angle,&rate)!=1) goto fail;
-  printf("Recovery sweep left: gyro %d, %s (%d)\n",angle,get_colour_name(colour),colour);
-  fflush(stdout);
-  if (colour==1)
+  if (colour==5)
   {
-   if (BT_motor_port_stop(MOTOR_B|MOTOR_C,1)!=0) return -1;
-   return 1;
+   int confirmation=sample_alignment_colour();
+   if (confirmation!=5) colour=confirmation==1||confirmation==4 ? confirmation : 0;
   }
-  next_angle=(angle/ALIGN_SWEEP_STEP_DEGREES-1)*ALIGN_SWEEP_STEP_DEGREES;
+  if (colour<0) return -1;
+  printf("Wiggle right %d: %s (%d)\n",turned_right,get_colour_name(colour),colour);
+  if (colour==1||colour==4||colour==5) return colour;
  }
- if (BT_motor_port_stop(MOTOR_B|MOTOR_C,1)!=0||
-   BT_read_gyro(GYRO_SENSOR_PORT,0,&angle,&rate)!=1) return -1;
  return 0;
-
-fail:
- BT_motor_port_stop(MOTOR_B|MOTOR_C,1);
- return -1;
 }
 
 static int recover_black_heading(void)
 {
- printf("Line lost; sweeping right 30 degrees, then left up to 60 degrees for black.\n");
- if (continuous_recovery_sweep()!=1)
+ printf("Line lost; stopping, sweeping left 30 degrees, then right through to +30 degrees.\n");
+ int result=continuous_recovery_sweep();
+ if (result==4)
+ {
+  printf("Yellow intersection found during recovery wiggle; stopping there.\n");
+  return 4;
+ }
+ if (result==5)
+ {
+  printf("Red boundary found during recovery sweep.\n");
+  return 5;
+ }
+ if (result!=1)
  {
   fprintf(stderr,"Black line not found in the bounded recovery sweep.\n");
   return 0;
@@ -1347,20 +1456,15 @@ static int follow_black_street(void)
 {
  const double max_forward_revolutions=0.75;
  const int timeout_ms=30000;
- const int search_bias_limit=6;
- const long search_direction_period_ms=1500;
+ const int follow_power=10;
+ const int steering_correction_limit=4;
  int angle,rate,right_previous,left_previous;
  if (movement_setup(NULL,0)!=0||BT_read_gyro(GYRO_SENSOR_PORT,1,&angle,&rate)!=1||
    read_wheel_degrees(&right_previous,&left_previous)!=0) return 0;
  double forward_revolutions=0;
- int search_bias=0;
- int search_direction=1;
- long off_black_ms=0;
- long next_direction_change_ms=search_direction_period_ms;
+ int last_healthy_colour=1;
  struct timespec start;
- struct timespec previous_sample_time;
  clock_gettime(CLOCK_MONOTONIC,&start);
- previous_sample_time=start;
  printf("Following black street until yellow or red.\n");
 
  for (;;)
@@ -1387,18 +1491,18 @@ static int follow_black_street(void)
    return 0;
   }
 
-  int colour=sample_stable_colour();
-  struct timespec sample_time;
-  clock_gettime(CLOCK_MONOTONIC,&sample_time);
-  long sample_elapsed=(sample_time.tv_sec-previous_sample_time.tv_sec)*1000L+
-    (sample_time.tv_nsec-previous_sample_time.tv_nsec)/1000000L;
-  previous_sample_time=sample_time;
-  if (sample_elapsed<1) sample_elapsed=1;
+  int colour=sample_street_event_colour();
+  if (colour==0)
+  {
+   colour=last_healthy_colour;
+   printf("Unknown street reading; retaining last healthy colour %s.\n",
+     get_colour_name(last_healthy_colour));
+  }
   if (colour==4)
   {
    stop_with(STOP_COLOUR,colour);
-   printf("Intersection reached.\n");
-   return 1;
+    printf("Intersection reached; stopped on yellow.\n");
+    return 1;
   }
   if (colour==5)
   {
@@ -1408,11 +1512,8 @@ static int follow_black_street(void)
   }
   if (colour==1)
   {
-   if (off_black_ms>0) printf("Black reacquired; easing steering back to center.\n");
-   off_black_ms=0;
-   next_direction_change_ms=search_direction_period_ms;
-   if (search_bias>0) search_bias--;
-   else if (search_bias<0) search_bias++;
+    last_healthy_colour=colour;
+    // Stay on the gyro-held heading while the sensor confirms the road.
   }
   else
   {
@@ -1422,16 +1523,18 @@ static int follow_black_street(void)
     BT_motor_port_stop(MOTOR_B|MOTOR_C,1);
     return 0;
    }
-   off_black_ms+=sample_elapsed;
-   if (off_black_ms>=next_direction_change_ms)
-   {
-    search_direction=-search_direction;
-    next_direction_change_ms+=search_direction_period_ms;
-    printf("Still off black (%s); smoothly searching the other side.\n",get_colour_name(colour));
-   }
-   int target_bias=search_direction*search_bias_limit;
-   if (search_bias<target_bias) search_bias++;
-   else if (search_bias>target_bias) search_bias--;
+    if (BT_motor_port_stop(MOTOR_B|MOTOR_C,1)!=0) return 0;
+    printf("Black lost (%s); starting bounded left/right wiggle.\n",get_colour_name(colour));
+    int recovery= recover_black_heading();
+    if (recovery==4) return 1;
+    if (recovery==5) return 2;
+    if (recovery!=1) return 0;
+    if (read_wheel_degrees(&right_previous,&left_previous)!=0)
+    {
+     BT_motor_port_stop(MOTOR_B|MOTOR_C,1);
+     return 0;
+    }
+    continue;
   }
 
   if (BT_read_gyro(GYRO_SENSOR_PORT,0,&angle,&rate)!=1)
@@ -1439,11 +1542,11 @@ static int follow_black_street(void)
    BT_motor_port_stop(MOTOR_B|MOTOR_C,1);
    return 0;
   }
-  int correction=(int)(MOVE_HEADING_GAIN*angle)-search_bias;
-  if (correction>MOVE_HEADING_LIMIT) correction=MOVE_HEADING_LIMIT;
-  if (correction< -MOVE_HEADING_LIMIT) correction=-MOVE_HEADING_LIMIT;
-  if (BT_turn(MOTOR_C,clamp_power(MOVE_CRUISE_POWER-correction),
-        MOTOR_B,clamp_power(MOVE_CRUISE_POWER+correction))!=0)
+    int correction=(int)(MOVE_HEADING_GAIN*angle);
+    if (correction>steering_correction_limit) correction=steering_correction_limit;
+    if (correction< -steering_correction_limit) correction=-steering_correction_limit;
+    if (BT_turn(MOTOR_C,follow_power-correction,
+      MOTOR_B,follow_power+correction)!=0)
   {
    BT_motor_port_stop(MOTOR_B|MOTOR_C,1);
    return 0;
