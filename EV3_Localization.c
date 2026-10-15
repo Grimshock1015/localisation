@@ -82,7 +82,7 @@ static int next_follow_alignment_colour=1;
 #define RECOVERY_SWEEP_RIGHT_DEGREES 60
 #define RECOVERY_SWEEP_LEFT_DEGREES 120
 #define ROAD_CENTER_STEP_DEGREES 5
-#define ROAD_CENTER_MAX_SWEEP_DEGREES 60
+#define ROAD_CENTER_MAX_SWEEP_DEGREES 40
 #define FIND_STREET_MAX_REV 1.1
 #define FIND_STREET_TIMEOUT_MS 22000
 #define ALIGNMENT_TURN_OVERSHOOT_DEGREES 0
@@ -793,6 +793,8 @@ static const char *const calibration_colours[]={"red","green","blue","yellow","b
 static const int calibration_map_ids[]={5,3,2,4,1,6};
 static int colour_calibration_samples[6][CALIBRATION_SAMPLES_PER_COLOUR][3];
 static int colour_calibration_loaded=0;
+static double hsv_neutral_saturation_threshold=0.0;
+static double hsv_black_white_value_threshold=0.0;
 static int confirmed_colour=0;               // Last colour confirmed by three consecutive readings.
 static int candidate_colour=0;               // Colour currently accumulating a confirmation streak.
 static int candidate_count=0;                // Consecutive matches, capped at three.
@@ -805,9 +807,31 @@ void reset_sensor_color_filter(void)
  candidate_count=0;
 }
 
+static void rgb_to_hsv(const int channels[3],double *hue,double *saturation,double *value)
+{
+ double red=fmax(0.0,(double)channels[0]);
+ double green=fmax(0.0,(double)channels[1]);
+ double blue=fmax(0.0,(double)channels[2]);
+ double maximum=fmax(red,fmax(green,blue));
+ double minimum=fmin(red,fmin(green,blue));
+ double delta=maximum-minimum;
+
+ *value=maximum/32767.0;
+ *saturation=maximum>0.0 ? delta/maximum : 0.0;
+ if (delta==0.0)
+  *hue=0.0;
+ else if (maximum==red)
+  *hue=60.0*fmod((green-blue)/delta,6.0);
+ else if (maximum==green)
+  *hue=60.0*((blue-red)/delta+2.0);
+ else
+  *hue=60.0*((red-green)/delta+4.0);
+ if (*hue<0.0) *hue+=360.0;
+}
+
 int load_colour_calibration(const char *directory)
 {
- // Load six complete NXT captures for nearest-sample classification.
+ // Load six complete NXT captures for calibrated HSV classification.
  colour_calibration_loaded=0;
  reset_sensor_color_filter();
  for (int colour_index=0;colour_index<6;colour_index++)
@@ -846,33 +870,69 @@ int load_colour_calibration(const char *directory)
   fclose(input);
   if (failed) return -1;
  }
- // Enable classification only after all six NXT calibration files validate.
+
+ // Learn the achromatic saturation gate and black/white brightness boundary from these captures.
+ double neutral_saturation_max=0.0;
+ double chromatic_saturation_min=1.0;
+ double black_value_max=0.0;
+ double white_value_min=1.0;
+ for (int colour_index=0;colour_index<6;colour_index++)
+  for (int sample=0;sample<CALIBRATION_SAMPLES_PER_COLOUR;sample++)
+  {
+   double hue,saturation,value;
+   rgb_to_hsv(colour_calibration_samples[colour_index][sample],&hue,&saturation,&value);
+   int colour=calibration_map_ids[colour_index];
+   if (colour==1||colour==6)
+   {
+    if (saturation>neutral_saturation_max) neutral_saturation_max=saturation;
+    if (colour==1&&value>black_value_max) black_value_max=value;
+    if (colour==6&&value<white_value_min) white_value_min=value;
+   }
+   else if (saturation<chromatic_saturation_min)
+    chromatic_saturation_min=saturation;
+  }
+ hsv_neutral_saturation_threshold=(neutral_saturation_max+chromatic_saturation_min)/2.0;
+ hsv_black_white_value_threshold=(black_value_max+white_value_min)/2.0;
+
+ // Enable classification only after all six NXT captures and their HSV thresholds validate.
  colour_calibration_loaded=1;
  return 0;
 }
 
 static int classify_sensor_rgb(const int channels[3])
 {
- // Require a clear nearest-class margin; ambiguous RGB values stay unknown instead of crossing colour boundaries.
+ // Use saturation and value for black/white, then compare chromatic samples by circular hue and HSV distance.
  if (!colour_calibration_loaded) return 0;
+ double hue,saturation,value;
+ rgb_to_hsv(channels,&hue,&saturation,&value);
+ if (saturation<=hsv_neutral_saturation_threshold)
+  return value<hsv_black_white_value_threshold ? 1 : 6;
+
  double colour_distances[7];
  for (int colour=0;colour<7;colour++) colour_distances[colour]=HUGE_VAL;
  for (int colour_index=0;colour_index<6;colour_index++)
+ {
+  int colour=calibration_map_ids[colour_index];
+  if (colour==1||colour==6) continue;
   for (int sample=0;sample<CALIBRATION_SAMPLES_PER_COLOUR;sample++)
   {
-   double distance=0;
-   for (int channel=0;channel<3;channel++)
-   {
-    double difference=(double)channels[channel]-colour_calibration_samples[colour_index][sample][channel];
-    distance+=difference*difference;
-   }
-   int colour=calibration_map_ids[colour_index];
+   double sample_hue,sample_saturation,sample_value;
+   rgb_to_hsv(colour_calibration_samples[colour_index][sample],
+     &sample_hue,&sample_saturation,&sample_value);
+   double hue_difference=fabs(hue-sample_hue);
+   if (hue_difference>180.0) hue_difference=360.0-hue_difference;
+   hue_difference=hue_difference/180.0*fmin(saturation,sample_saturation);
+   double saturation_difference=saturation-sample_saturation;
+   double value_difference=value-sample_value;
+   double distance=hue_difference*hue_difference+
+     saturation_difference*saturation_difference+value_difference*value_difference;
    if (distance<colour_distances[colour]) colour_distances[colour]=distance;
   }
+ }
 
  double nearest_distance=HUGE_VAL,second_distance=HUGE_VAL;
  int nearest_colour=0;
- for (int colour=1;colour<=6;colour++)
+ for (int colour=2;colour<=5;colour++)
  {
   if (colour_distances[colour]<nearest_distance)
    {
@@ -1196,7 +1256,7 @@ int calibrate_sensor(void)
 
 // ---- Smooth movement: gyro-held straight drives and gyro-controlled turns ----
 #define MOVE_CRUISE_POWER 8
-#define MOVE_MIN_POWER 12
+#define MOVE_MIN_POWER 8
 #define MOVE_RAMP_UP_MS 500
 #define MOVE_RAMP_DOWN_DEGREES 90.0
 #define MOVE_HEADING_GAIN 1.5
