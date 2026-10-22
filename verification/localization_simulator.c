@@ -10,6 +10,8 @@
 #include <stdarg.h>
 
 #include "simulation_map.inc"
+#define MOTOR_B 2
+#define MOTOR_C 4
 
 int map[400][4];
 int sx,sy;
@@ -19,6 +21,12 @@ static int scans,trips,boundaries;
 static double wrong_probability,unknown_probability;
 static double turn_error_probability,stay_probability;
 static int scan_offset,trace_enabled;
+static int scan_heading_override=-1;
+static int available_corners_override=-1;
+static int acquiring_first_intersection;
+static int fail_initial_approach;
+static int initial_colour,confirmed_initial_colour,initial_colour_reads;
+static int alignment_calls,brake_calls,brake_failure;
 static uint32_t random_state;
 
 // Avoid writing large traces during sweeps; keep CSV output and assertion errors.
@@ -57,8 +65,13 @@ static void check_beliefs(void)
  assert(fabs(total-1.0)<1e-10);
 }
 
-static int find_street(void) {return 1;}
-static int align_to_street(void) {return 1;}
+static int find_street(void) {assert(!acquiring_first_intersection);return 1;}
+static int align_to_street(void)
+{assert(!acquiring_first_intersection);alignment_calls++;return 1;}
+static int sample_alignment_colour(void)
+{return initial_colour_reads++==0 ? initial_colour : confirmed_initial_colour;}
+static int BT_motor_port_stop(int ports,int brake)
+{assert(ports==(MOTOR_B|MOTOR_C)&&brake==1);return ++brake_calls==brake_failure ? -1 : 0;}
 
 static int drive_to_next_intersection(int *direction,int *boundary_return)
 {
@@ -66,7 +79,13 @@ static int drive_to_next_intersection(int *direction,int *boundary_return)
  *boundary_return=0;
  // Start poses describe the first scanned intersection. The initial approach
  // arrives there without an intersection-to-intersection motion update.
- if (trips++==0) return 1;
+ trips++;
+ if (scans==0)
+ {
+  assert(acquiring_first_intersection==1);
+  return !fail_initial_approach;
+ }
+ assert(acquiring_first_intersection==0);
  const int dx[4]={0,1,0,-1},dy[4]={-1,0,1,0};
  int x=actual_x+dx[actual_heading],y=actual_y+dy[actual_heading];
  if (x<0||x>=sx||y<0||y>=sy)
@@ -85,6 +104,7 @@ static int drive_to_next_intersection(int *direction,int *boundary_return)
 
 static int turn_at_intersection(int turn_direction)
 {
+ assert(acquiring_first_intersection==0);
  assert(turn_direction==0||turn_direction==1);
  int shift=turn_direction==0 ? 1 : 3;
  if (turn_error_probability>0.0&&random_unit()<turn_error_probability)
@@ -95,27 +115,29 @@ static int turn_at_intersection(int turn_direction)
 
 static int scan_intersection(int *tl,int *tr,int *br,int *bl)
 {
+ assert(acquiring_first_intersection==0);
  check_beliefs();
  scans++;
  int *outputs[4]={tl,tr,br,bl};
  const int colour_ids[3]={2,3,6};
- int complete=1;
  printf("SIM truth: (%d,%d), heading=%d, scan=%d\n",
         actual_x,actual_y,actual_heading,scans);
  for (int c=0;c<4;c++)
  {
   int colour=map[actual_y*sx+actual_x][(c+actual_heading+scan_offset)%4];
   // Independent draws: wrong_probability applies to non-missing readings.
-  if (random_unit()<unknown_probability) {colour=-1;complete=0;}
+  if (random_unit()<unknown_probability) colour=-1;
   else if (random_unit()<wrong_probability)
   {
    int alternatives[2],count=0;
    for (int k=0;k<3;k++) if (colour_ids[k]!=colour) alternatives[count++]=colour_ids[k];
    colour=alternatives[random_unit()<0.5 ? 0 : 1];
   }
+  if (available_corners_override>=0&&c>=available_corners_override) colour=-1;
   *outputs[c]=colour;
  }
- return complete;
+ // Missing colours do not imply a failed physical rotation/return to heading.
+ return scan_heading_override>=0 ? scan_heading_override : 1;
 }
 
 static const char *get_colour_name(int colour)
@@ -136,6 +158,11 @@ static void reset_case(int x,int y,int heading,uint32_t seed)
 {
  actual_x=x;actual_y=y;actual_heading=heading;
  scans=trips=boundaries=0;
+ // Simulate stale state so every localization entry must clear the exception
+ // before street acquisition, not just before its first forward approach.
+ acquiring_first_intersection=1;fail_initial_approach=0;
+ initial_colour=confirmed_initial_colour=1;
+ initial_colour_reads=alignment_calls=brake_calls=brake_failure=0;
  random_state=seed;
  for (int i=0;i<sx*sy;i++)
   for (int h=0;h<4;h++) beliefs[i][h]=1.0/(sx*sy*4);
@@ -195,6 +222,111 @@ static void check_motion_models(void)
  assert(!update_beliefs_from_scan(observed));
 }
 
+static void set_confirmation_prior(double leading_probability)
+{
+ for (int index=0;index<sx*sy;index++)
+  for (int heading=0;heading<4;heading++)
+   beliefs[index][heading]=(1.0-leading_probability)/(sx*sy*4-1);
+ beliefs[actual_y*sx+actual_x][actual_heading]=leading_probability;
+ check_beliefs();
+}
+
+static void check_single_scan_confirmation(void)
+{
+ sx=sy=3;
+ for (int index=0;index<sx*sy;index++) for (int corner=0;corner<4;corner++) map[index][corner]=2;
+ wrong_probability=unknown_probability=0.0;
+ int x,y,h;
+ // Failure during the initial approach must clear the one-trip exception,
+ // retain unknown coordinates, and never enter an intersection scan.
+ reset_case(1,1,0,1);fail_initial_approach=1;
+ x=y=h=99;
+ assert(!robot_localization(&x,&y,&h));
+ assert(acquiring_first_intersection==0&&scans==0&&trips==1&&x==-1&&y==-1);
+ check_beliefs();
+ // Initial yellow is this first intersection already: no full alignment or
+ // approach should move the robot away before its first verified scan.
+ reset_case(1,1,0,1);set_confirmation_prior(0.90);
+ initial_colour=confirmed_initial_colour=4;
+ assert(robot_localization(&x,&y,&h));
+ assert(scans==1&&trips==0&&alignment_calls==0&&brake_calls==1);
+ assert(initial_colour_reads==2&&acquiring_first_intersection==0&&x==1&&y==1&&h==0);
+ check_beliefs();
+ // Subsequent trips after direct acquisition still require normal departure.
+ reset_case(1,1,0,1);initial_colour=confirmed_initial_colour=4;
+ scan_heading_override=0;
+ assert(!robot_localization(&x,&y,&h));
+ assert(scans==24&&trips==23&&alignment_calls==0&&acquiring_first_intersection==0);
+ scan_heading_override=-1;check_beliefs();
+ // A yellow flicker must use ordinary alignment/approach, not direct scanning.
+ reset_case(1,1,0,1);set_confirmation_prior(0.90);
+ initial_colour=4;confirmed_initial_colour=1;
+ assert(robot_localization(&x,&y,&h));
+ assert(scans==1&&trips==1&&alignment_calls==1&&brake_calls==1);
+ check_beliefs();
+ reset_case(1,1,0,1);initial_colour=-1;
+ assert(!robot_localization(&x,&y,&h));
+ assert(scans==0&&trips==0&&alignment_calls==0&&acquiring_first_intersection==0&&x==-1&&y==-1);
+ reset_case(1,1,0,1);initial_colour=4;confirmed_initial_colour=-1;
+ assert(!robot_localization(&x,&y,&h));
+ assert(scans==0&&trips==0&&alignment_calls==0&&acquiring_first_intersection==0&&x==-1&&y==-1);
+ reset_case(1,1,0,1);initial_colour=confirmed_initial_colour=4;brake_failure=1;
+ assert(!robot_localization(&x,&y,&h));
+ assert(scans==0&&trips==0&&alignment_calls==0&&initial_colour_reads==1&&x==-1&&y==-1);
+ // A roughly 11.67x lead confirms immediately despite only 25% absolute belief.
+ reset_case(1,1,0,1);set_confirmation_prior(0.25);
+ assert(robot_localization(&x,&y,&h));
+ assert(scans==1&&trips==1&&x==1&&y==1&&h==0);
+ assert(beliefs[4][0]<0.26);check_beliefs();
+ // A roughly 8.75x lead must not confirm on the first complete scan.
+ reset_case(1,1,0,1);set_confirmation_prior(0.20);
+ (void)robot_localization(&x,&y,&h);assert(scans>1);check_beliefs();
+ // Exercise the probability-backed rule with a competing pose below the 10x lead.
+ const double probabilities[][2]={{0.8001,0.16},{0.7999,0.16},
+                                  {0.7001,0.1399},{0.6999,0.1399},
+                                  {0.70,0.13}};
+ const int accepts[]={1,0,1,0,0};
+ for (int test=0;test<5;test++)
+ {
+  reset_case(1,1,0,1);
+  double leading=probabilities[test][0],second=probabilities[test][1];
+  for (int index=0;index<sx*sy;index++) for (int heading=0;heading<4;heading++)
+   beliefs[index][heading]=(1.0-leading-second)/(sx*sy*4-2);
+  beliefs[4][0]=leading;beliefs[0][0]=second;
+  check_beliefs();
+  int success=robot_localization(&x,&y,&h);
+  if (accepts[test]) assert(success&&scans==1&&trips==1&&x==1&&y==1&&h==0);
+  else assert(scans>1);
+  check_beliefs();
+ }
+ // Four valid colours cannot override a failed return-to-street status.
+ scan_heading_override=0;
+ reset_case(1,1,0,1);set_confirmation_prior(0.90);
+ assert(!robot_localization(&x,&y,&h)&&scans==24);check_beliefs();
+ // Strong prior confidence is sufficient with 0, 1, 2 or 3 available colours,
+ // provided the physical sweep/return to heading was verified.
+ scan_heading_override=1;
+ for (int available=0;available<4;available++)
+ {
+  available_corners_override=available;
+  reset_case(1,1,0,1);set_confirmation_prior(0.90);
+  assert(robot_localization(&x,&y,&h));
+  assert(scans==1&&trips==1&&x==1&&y==1&&h==0);check_beliefs();
+ }
+ // The 10x relative-only branch also applies when no new colours are available.
+ available_corners_override=0;
+ reset_case(1,1,0,1);set_confirmation_prior(0.25);
+ assert(robot_localization(&x,&y,&h)&&scans==1);check_beliefs();
+ // Missing colours cannot manufacture a sufficient lead from a weak prior.
+ reset_case(1,1,0,1);set_confirmation_prior(0.20);
+ (void)robot_localization(&x,&y,&h);assert(scans>1);check_beliefs();
+ // A failed heading verification cannot confirm even the same strong prior.
+ scan_heading_override=0;
+ reset_case(1,1,0,1);set_confirmation_prior(0.90);
+ assert(!robot_localization(&x,&y,&h)&&scans==24);check_beliefs();
+ scan_heading_override=available_corners_override=-1;unknown_probability=0.0;
+}
+
 static void check_ambiguity_and_missing(void)
 {
  sx=sy=2;
@@ -204,7 +336,7 @@ static void check_ambiguity_and_missing(void)
  int x,y,h;
  assert(!robot_localization(&x,&y,&h));
  assert(scans==24);check_beliefs();
- // All-unknown scans on the real map must not count as confirmation either.
+ // All-unknown scans from a uniform prior must not manufacture confidence.
  sx=SIM_WIDTH;sy=SIM_HEIGHT;
  memcpy(map,simulation_map,sizeof(simulation_map));
  unknown_probability=1.0;
@@ -222,6 +354,7 @@ int main(int argc,char **argv)
  assert(argc==13);
  check_corner_order();
  check_motion_models();
+ check_single_scan_confirmation();
  check_ambiguity_and_missing();
  wrong_probability=atof(argv[1]);unknown_probability=atof(argv[2]);
  int trials=atoi(argv[3]);uint32_t seed=(uint32_t)strtoul(argv[4],NULL,10);

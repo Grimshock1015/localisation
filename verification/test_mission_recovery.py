@@ -29,7 +29,7 @@ def main():
                         '-o', str(executable)], check=True)
         result = subprocess.run([str(executable)], capture_output=True, text=True)
     rows = [line.split(',')[1:] for line in result.stdout.splitlines() if line.startswith('TEST,')]
-    if result.returncode not in (0, 1) or len(rows) != 16:
+    if result.returncode not in (0, 1) or len(rows) != 20:
         print(result.stdout + result.stderr, file=sys.stderr)
         raise RuntimeError('Mission tests crashed or did not complete')
     failed = [row for row in rows if row[1] == 'FAIL']

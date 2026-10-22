@@ -8,6 +8,7 @@
 
 #define MOTOR_B 2
 #define MOTOR_C 4
+#define ALIGNMENT_AXIS_ADVANCE_REV 0.27
 typedef enum {STOP_ERROR=-1,STOP_TIMEOUT=0,STOP_DISTANCE=1,STOP_COLOUR=2,STOP_ANGLE=3} StopReason;
 typedef struct {StopReason reason;int colour;} MoveResult;
 typedef enum {NAV_STEP_ERROR=-1,NAV_STEP_LOST=0,NAV_STEP_MOVED=1,NAV_STEP_ARRIVED=2} NavigationStepResult;
@@ -15,6 +16,8 @@ typedef enum {NAV_STEP_ERROR=-1,NAV_STEP_LOST=0,NAV_STEP_MOVED=1,NAV_STEP_ARRIVE
 int sx=3,sy=5;
 double beliefs[400][4];
 static int next_follow_alignment_colour;
+static int intersection_axle_centered;
+static int advance_calls,yellow_center_calls,marker_colour,centering_failure,advance_failure;
 static int physical_x,physical_y,physical_heading;
 static int localization_calls,drive_calls,brake_calls,filter_resets;
 static int wrong_pose_attempts,failed_localizations,invalid_localized_pose;
@@ -28,6 +31,7 @@ static int robot_localization(int *x,int *y,int *heading)
  localization_calls++;
  assert(*x==-1&&*y==-1&&*heading==-1);
  assert(filter_resets==localization_calls&&stale_colour==0&&next_follow_alignment_colour==1);
+ assert(intersection_axle_centered==0);
  for (int i=0;i<sx*sy;i++) for (int h=0;h<4;h++)
   assert(fabs(beliefs[i][h]-1.0/(sx*sy*4))<1e-12);
  // Deliberately leave stale state behind to check the next recovery reset.
@@ -37,7 +41,23 @@ static int robot_localization(int *x,int *y,int *heading)
  *x=physical_x;*y=physical_y;*heading=physical_heading;
  if (localization_calls<=wrong_pose_attempts) *x=1;
  if (invalid_localized_pose) *x=-1;
+ intersection_axle_centered=1;
  return 1;
+}
+
+static int sample_alignment_colour(void) {return marker_colour;}
+static int center_on_alignment_marker(int colour)
+{
+ assert(colour==4&&!intersection_axle_centered);
+ yellow_center_calls++;
+ return !centering_failure;
+}
+static MoveResult move_forward_until(const int *colours,int count,double revolutions,int timeout)
+{
+ assert(colours==NULL&&count==0&&revolutions==0.27&&timeout==5000);
+ assert(!intersection_axle_centered&&yellow_center_calls>advance_calls);
+ advance_calls++;
+ MoveResult result={advance_failure ? STOP_TIMEOUT : STOP_DISTANCE,0};return result;
 }
 
 static int BT_motor_port_stop(int motors,int brake)
@@ -49,6 +69,7 @@ static int BT_motor_port_stop(int motors,int brake)
 
 static int turn_at_intersection(int direction)
 {
+ assert(intersection_axle_centered);
  assert(direction==0||direction==1);
  if (failed_turns>0) {failed_turns--;return 0;}
  physical_heading=(physical_heading+(direction==0 ? 1 : 3))%4;
@@ -57,6 +78,7 @@ static int turn_at_intersection(int direction)
 
 static MoveResult turn_in_place(int degrees,int direction,int timeout)
 {
+ assert(intersection_axle_centered);
  assert(degrees==180&&direction==0&&timeout>0);
  MoveResult result={STOP_ANGLE,0};
  if (failed_half_turns>0) {failed_half_turns--;result.reason=STOP_TIMEOUT;}
@@ -69,6 +91,8 @@ static int report_move_result(const char *label,MoveResult result)
 
 static int drive_along_street(void)
 {
+ assert(intersection_axle_centered&&next_follow_alignment_colour==1);
+ intersection_axle_centered=0;
  drive_calls++;
  const int dx[4]={0,1,0,-1},dy[4]={-1,0,1,0};
  int x=physical_x+dx[physical_heading],y=physical_y+dy[physical_heading];
@@ -87,6 +111,8 @@ static void reset(void)
  wrong_pose_attempts=failed_localizations=invalid_localized_pose=0;
  failed_turns=failed_half_turns=forced_red=brake_failure_call=0;
  stale_colour=5;next_follow_alignment_colour=4;
+ intersection_axle_centered=0;
+ advance_calls=yellow_center_calls=centering_failure=advance_failure=0;marker_colour=4;
  memset(beliefs,0,sizeof(beliefs));beliefs[0][0]=1;
 }
 
@@ -166,9 +192,44 @@ static int all_900_routes(void)
   for (int ty=0;ty<5;ty++) for (int tx=0;tx<3;tx++) for (int h=0;h<4;h++)
   {
    physical_x=x;physical_y=y;physical_heading=h;drive_calls=0;
+   intersection_axle_centered=1;
    CHECK(go_to_target(x,y,h,tx,ty));
    CHECK(physical_x==tx&&physical_y==ty&&drive_calls==abs(tx-x)+abs(ty-y));
   }
+ return 1;
+}
+
+static int positions_after_arrival_only(void)
+{
+ physical_x=0;physical_y=1;physical_heading=0;
+ CHECK(run_mission(1,2,0));
+ CHECK(drive_calls==2&&advance_calls==1&&yellow_center_calls==1);
+ CHECK(physical_x==1&&physical_y==2&&!intersection_axle_centered);
+ return 1;
+}
+
+static int yellow_required_before_turn(void)
+{
+ int x=2,y=0,h=1;marker_colour=1;
+ CHECK(navigate_one_step(&x,&y,&h,2,4)==NAV_STEP_LOST);
+ CHECK(x==-1&&y==-1&&h==-1&&physical_heading==1);
+ CHECK(drive_calls==0&&advance_calls==0&&yellow_center_calls==0);
+ return 1;
+}
+
+static int yellow_center_failure(void)
+{
+ int x=2,y=0,h=1;centering_failure=1;
+ CHECK(navigate_one_step(&x,&y,&h,2,4)==NAV_STEP_LOST);
+ CHECK(physical_heading==1&&drive_calls==0&&advance_calls==0);
+ return 1;
+}
+
+static int axle_advance_failure(void)
+{
+ int x=2,y=0,h=1;advance_failure=1;
+ CHECK(navigate_one_step(&x,&y,&h,2,4)==NAV_STEP_LOST);
+ CHECK(physical_heading==1&&drive_calls==0&&advance_calls==1&&!intersection_axle_centered);
  return 1;
 }
 
@@ -185,7 +246,11 @@ int main(void)
   {"initial_brake_failure",initial_brake_failure},{"lost_pose_brake_failure",lost_pose_brake_failure},
   {"retry_brake_failure",retry_brake_failure},{"already_arrived",already_at_destination},
   {"invalid_inputs",invalid_mission_inputs},{"legacy_contract",legacy_navigation_contract},
-  {"900_full_routes",all_900_routes}
+  {"900_full_routes",all_900_routes},
+  {"position_after_arrival_only",positions_after_arrival_only},
+  {"yellow_before_turn",yellow_required_before_turn},
+  {"yellow_center_failure",yellow_center_failure},
+  {"axle_advance_failure",axle_advance_failure}
  };
  int failures=0;
  for (unsigned i=0;i<sizeof(tests)/sizeof(tests[0]);i++)

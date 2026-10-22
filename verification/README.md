@@ -1,5 +1,49 @@
 # Robot-free localization checks
 
+Localisation confirms when the physical sweep verifies the street heading and
+the accumulated best position/heading belief is at least 10 times as likely as
+the runner-up, or its probability is over 70% with at least a 5x lead. There is
+no minimum number of visible corners and no consecutive-scan requirement.
+Unknown or tied corner readings are ignored by the likelihood update; earlier
+scans and movement retain their evidence. With no visible corners, confirmation
+is possible only if the accumulated belief already passes the same thresholds.
+A failed physical sweep/heading verification cannot confirm, even with strong
+belief or four valid colours. `scan_intersection` reports physical heading
+verification separately from corner availability; missing corners remain -1.
+The limit remains 24 scans per localisation attempt. Simulator fixtures check
+immediate acceptance, both sides of the 70% and 5x thresholds, failed headings,
+and missing corner readings.
+
+The first intersection search may accept stationary confirmed yellow without
+a prior black departure, including yellow found during alignment or recovery.
+When initial acquisition already stops on confirmed yellow, localisation skips
+the extra full alignment/forward approach and scans at that intersection.
+This establishes the first scan location and does not apply a forward belief
+transition. The exception is cleared immediately after the initial approach,
+including failure; all later trips still require black before yellow.
+
+Navigation distinguishes an axle already positioned by a scan from a sensor-only
+arrival on yellow. Before leaving an ordinary arrival, it verifies/centres yellow
+and advances the existing sensor-to-axle offset before turning. The street follower
+verifies outgoing black and requires an actual black reading during departure
+before accepting the next yellow. Unknown readings cannot count as that black
+observation. The 0.27-revolution offset still needs physical calibration.
+Street reacquisition and marker-edge checks try right before left; a missed side
+returns to the entry heading before searching the other side. The search remains
+bounded to 30 degrees per side in 5-degree increments.
+During recovery from a lost street while driving, confirmed yellow also ends
+black centring immediately, including edge and midpoint probes. Yellow is checked
+again while stopped, then returned as an intersection event. The follower still
+requires a prior black departure before counting it as the next intersection.
+Normal turn alignment and the four-street building scan retain their existing
+rules; yellow during those operations does not trigger this recovery shortcut.
+
+Run `python3 verification/test_street_departure.py` for scripted departure events
+and `python3 verification/test_mission_recovery.py` for placement, route and retry
+checks. These tests do not establish physical centring or turn accuracy.
+`python3 verification/test_recovery_yellow.py` checks yellow detection during
+driving recovery and verifies that confirmed yellow is not swept away from.
+
 ## One-street hardware diagnostic
 
 In Ubuntu/WSL, build and run an interactive series. It waits for manual placement
@@ -8,6 +52,10 @@ between trials and never drives back automatically:
 ```sh
 python3 verification/run_street_trials.py calibration/run-5 --trials 10 --power 10
 ```
+
+Keep the EV3 at its main menu with Port View closed and no competing program
+running. In stationary tests, leaving Port View resolved repeated invalid sensor
+values in both the independent reader and the production C reader.
 
 Start with the colour sensor on black just beyond yellow, facing the intended
 next yellow intersection. Each trial checks stationary gyro stability, runs the
@@ -22,11 +70,109 @@ The runner uses the existing-connection signal brake and a 120-second outer limi
 leaves physical success unverified. Compare lower powers only after recording
 a baseline; changing diagnostic power does not alter normal mission power.
 
+Then test a turn followed by one street:
+
+```sh
+python3 verification/run_street_trials.py calibration/run-5 --turn right --trials 5
+python3 verification/run_street_trials.py calibration/run-5 --turn left --trials 5
+```
+
+For these tests, manually place the drive-wheel axle over the center of an
+interior yellow intersection, facing a street with the sensor on black ahead.
+The selected turn must lead to another yellow intersection. The diagnostic turns
+90 degrees and checks black before any alignment recovery. If it misses black,
+it stops instead of disguising a bad turn with a recovery sweep. Logs record the
+gyro angle after the turn and the separate street outcome. Operator confirmation
+must verify that it turned the requested way and reached the correct next marker.
+
 Run the robot-free preflight/outcome tests with:
 
 ```sh
 python3 verification/test_street_segment.py
 ```
+
+Centering keeps one gyro reference across its edge probes, returns to the measured
+entry heading when an edge is missing, and checks the marker before continuing.
+Its robot-free regression covers accumulated small-turn error, missing edges,
+midpoint alignment, search acquisition and failed reads/brakes:
+
+```sh
+python3 verification/test_centering.py
+```
+
+The Bluetooth gyro reader rejects EV3 invalid-data sentinels before changing the
+reference or calculating relative angles. It transfers complete reply frames,
+validates message ID/status/size, and checks subtraction in 64-bit arithmetic.
+The motion caller brakes when a gyro read fails. These checks prevent invalid
+data from becoming a huge commanded heading; they do not correct sensor drift.
+
+```sh
+python3 verification/test_gyro_reader.py
+```
+
+## One-step navigation hardware diagnostic
+
+This diagnostic starts with the sensor over the centre of a yellow intersection,
+facing along a street. Do not manually move the axle onto yellow first: the test
+uses normal navigation to position it with the configured sensor-to-axle offset.
+Use an interior intersection with a clear street on the chosen side leading to
+the next yellow intersection. Keep Port View closed and the robot still at startup.
+
+In Ubuntu/WSL, from the project directory:
+
+```sh
+mkdir -p build
+g++ verification/robot_trial.cpp EV3_RobotControl/btcomm.c -lbluetooth -o build/EV3_RobotTrial
+./build/EV3_RobotTrial --test-navigation-step calibration/run-5 right
+# Reposition manually before testing the other direction:
+./build/EV3_RobotTrial --test-navigation-step calibration/run-5 left
+```
+
+The test calls the production navigation step once: position the axle, turn,
+reacquire black, and follow the street until yellow, red, or failure. There is no
+localisation scan or automatic mission retry. Its coordinates describe the test's
+relative origin/destination; they do not establish an absolute pose on Map1.
+Verify physically that it turns the selected way, reaches the intended adjacent
+yellow intersection, and stops both wheels.
+
+Run `python3 verification/test_navigation_step.py` for robot-free CLI validation.
+It rejects invalid arguments/calibration before Bluetooth and checks signal brake
+dispatch locally; it does not run a valid driving command or prove physical braking.
+
+## Counted intersection scan
+
+After initial street acquisition, intersection scans stop at gyro targets to
+sample colours. Steps are 10 degrees between streets and 5 degrees near expected
+crossings and while measuring black strips. A clean sample ends after four
+agreeing reads; mixed samples still use up to five and require four votes.
+Start and final-black checks use the same scan sampling rule. Other alignment
+and street-event sampling retain their existing five-reading behaviour.
+The initial black strip is excluded from the count.
+Two confirmed nonblack stops rearm detection; unknown readings do not. Black
+entries must be within 25 degrees of the next expected quarter turn (90, 180,
+270, 360). After the fourth strip, the scan measures its exit and returns to the
+midpoint, verifies black, and brakes. The old post-scan black recovery wiggle is
+removed. Initial street alignment still uses its existing continuous sweep.
+
+Missing streets/readings, an unverified midpoint, or failures stop the scan; it
+does not assume that another street is the starting heading. The sweep is bounded
+to 405 degrees and 180 seconds, with individual turns also bounded. This strict
+four-street requirement can reject intersections where the sensor cannot observe
+all four streets, including map edges. A centred axle and physical testing are
+still needed; simulated success does not establish robot reliability.
+
+```sh
+python3 verification/test_intersection_sweep.py
+```
+
+To isolate the actual production sweep from initial street acquisition, place
+the axle at an interior yellow intersection's centre with the sensor on black
+ahead. Build `verification/robot_trial.cpp` with `EV3_RobotControl/btcomm.c` and
+`-lbluetooth`, then run the wrapper with
+`--test-intersection-sweep calibration/run-5`. It checks stationary gyro/black,
+rotates in place once using the production counted sweep, then brakes and closes.
+It has no forward drive or mission retry. Confirm that it returns to the original
+street and that both wheels stop; sensor confirmation alone is not ground truth.
 
 For geometry, measure the forward horizontal axle-to-sensor-reading-point offset
 and wheel diameter in millimetres, then calculate the advance in wheel rotations:
@@ -39,6 +185,16 @@ The formula is offset / (pi * wheel diameter). This command does not connect to
 the robot or change configuration. The current `SENSOR_TO_AXLE_OFFSET_REV=0.27`
 remains an assumption until physical measurements are supplied. Keep the sensor
 at its calibrated mounted height and hold the robot still during gyro startup.
+
+The classifier also learns a dark-black brightness threshold when black is
+strictly darker than all nonblack calibration captures. This allows a dark,
+red-tinted black reading to remain black instead of selecting red by hue. If the
+captured brightness ranges overlap, the added gate is disabled. Test the captured
+black-street regression and overlap handling with:
+
+```sh
+python3 verification/test_colour_classifier.py
+```
 
 From the project directory, with Python 3 and gcc or g++ available:
 

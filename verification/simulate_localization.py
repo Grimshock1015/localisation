@@ -177,7 +177,7 @@ def main():
     for outcome in ('correct', 'incorrect', 'unresolved'):
         print(f'{outcome.capitalize()}: {sum(row["result"] == outcome for row in rows)}')
     print(f'Average scans: {sum(int(row["scans"]) for row in rows) / len(rows):.2f}')
-    print('Corner-order, motion-model, maximum-size, ambiguous-map, missing-scan and belief-invariant checks passed.')
+    print('Single-scan confirmation, corner-order, motion-model, maximum-size, ambiguous-map, missing-scan and belief-invariant checks passed.')
     print(f'CSV report: {report.resolve()}')
     print('Discrete simulated movement; hardware control and production PPM parser are not exercised.')
     return result.returncode

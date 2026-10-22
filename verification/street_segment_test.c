@@ -9,12 +9,18 @@
 static int street_follow_power=10;
 static int gyro_reads,gyro_fail,gyro_drift,start_colour,final_colour;
 static int brake_calls,brake_fail,encoder_calls,encoder_fail,follow_result,follow_calls;
+typedef enum {STOP_ERROR=-1,STOP_TIMEOUT=0,STOP_DISTANCE=1,STOP_COLOUR=2,STOP_ANGLE=3} StopReason;
+typedef struct {StopReason reason;int colour;} MoveResult;
+static int turn_calls,turn_colour,turn_direction;
+static StopReason turn_reason;
+static MoveResult turn_in_place(int degrees,int direction,int timeout)
+{assert(degrees==90&&timeout==10000);turn_calls++;turn_direction=direction;MoveResult result={turn_reason,0};return result;}
 static int BT_motor_port_stop(int ports,int brake)
 {assert(ports==6&&brake==1);return ++brake_calls==brake_fail ? -1 : 0;}
 static int BT_read_gyro(int port,int reset,int *angle,int *rate)
-{assert(port==1&&reset==0);*angle=gyro_drift ? gyro_reads*3 : 10;*rate=0;return ++gyro_reads==gyro_fail ? 0 : 1;}
+{assert(port==1&&reset==0);*angle=gyro_drift ? gyro_reads*3 : turn_calls ? 90 : 10;*rate=0;return ++gyro_reads==gyro_fail ? 0 : 1;}
 static int usleep(unsigned int microseconds) {(void)microseconds;return 0;}
-static int sample_alignment_colour(void) {return follow_calls ? final_colour : start_colour;}
+static int sample_alignment_colour(void) {return follow_calls ? final_colour : turn_calls ? turn_colour : start_colour;}
 static int read_wheel_degrees(int *right,int *left)
 {*right=follow_calls ? 360 : 0;*left=*right;return ++encoder_calls==encoder_fail ? -1 : 0;}
 static int follow_black_street(void) {follow_calls++;return follow_result;}
@@ -25,6 +31,7 @@ static void reset(void)
 {
  gyro_reads=gyro_fail=gyro_drift=brake_calls=brake_fail=encoder_calls=encoder_fail=follow_calls=0;
  start_colour=1;final_colour=4;follow_result=1;
+ turn_calls=0;turn_colour=1;turn_reason=STOP_ANGLE;turn_direction=-1;
 }
 int main(void)
 {
@@ -41,5 +48,13 @@ int main(void)
  reset();brake_fail=2;assert(run_street_segment_test()==0&&follow_calls==1);
  reset();encoder_fail=2;assert(run_street_segment_test()==0&&follow_calls==1);
  puts("12/12 one-segment outcome/preflight cases passed.");
+ reset();assert(run_turn_street_test(0)==1&&turn_calls==1&&turn_direction==0&&follow_calls==1);
+ reset();assert(run_turn_street_test(1)==1&&turn_calls==1&&turn_direction==1&&follow_calls==1);
+ reset();turn_reason=STOP_TIMEOUT;assert(run_turn_street_test(0)==0&&follow_calls==0);
+ reset();turn_colour=6;assert(run_turn_street_test(0)==0&&follow_calls==0);
+ reset();brake_fail=2;assert(run_turn_street_test(0)==0&&follow_calls==0);
+ reset();gyro_fail=6;assert(run_turn_street_test(0)==0&&follow_calls==0);
+ reset();start_colour=4;assert(run_turn_street_test(0)==0&&turn_calls==0);
+ puts("7/7 turn/align-before-follow cases passed.");
  return 0;
 }

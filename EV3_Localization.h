@@ -88,6 +88,7 @@ NavigationStepResult navigate_one_step(int *robot_x, int *robot_y, int *directio
                                       int target_x, int target_y);
 int find_street(void);
 int drive_along_street(void);
+// Returns 1 for a completed sweep with verified street heading; missing/tied corners remain -1.
 int scan_intersection(int *tl, int *tr, int *br, int *bl);
 int turn_at_intersection(int turn_direction);
 int calibrate_sensor(void);

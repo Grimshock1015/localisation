@@ -16,6 +16,7 @@ def main():
     parser.add_argument('calibration',type=Path)
     parser.add_argument('--trials',type=int,default=10)
     parser.add_argument('--power',type=int,default=10)
+    parser.add_argument('--turn',choices=('left','right'),help='Start with axle centered over yellow; test a 90-degree turn before following')
     parser.add_argument('--start-now',action='store_true',help='Skip first positioning prompt only when already ready')
     args=parser.parse_args()
     if not 1<=args.trials<=100 or not 1<=args.power<=20:
@@ -38,16 +39,19 @@ def main():
     passed=0
     with summary.open('x',newline='') as stream:
         writer=csv.writer(stream)
-        writer.writerow(['trial','power','returncode','sensor_outcome','operator_outcome','line_losses','log'])
+        writer.writerow(['trial','power','turn','returncode','sensor_outcome','operator_outcome','line_losses','log'])
         for trial in range(1,args.trials+1):
             if not (trial==1 and args.start_now):
                 try:
-                    response=input(f'\nTrial {trial}/{args.trials}: place sensor on black just beyond yellow, aimed at next yellow. Enter to start; q to finish: ')
+                    placement=f'center axle over interior yellow, sensor on black ahead; turn {args.turn} then travel to next yellow' if args.turn else 'place sensor on black just beyond yellow, aimed at next yellow'
+                    response=input(f'\nTrial {trial}/{args.trials}: {placement}. Enter to start; q to finish: ')
                 except EOFError: break
                 if response.strip().lower()=='q': break
             log=logs/f'trial-{trial:02d}.log'
             print(f'\nStarting trial {trial}; log {log}',flush=True)
-            command=[str(executable),'--test-street',str(calibration),str(args.power)]
+            command=[str(executable),'--test-turn-street' if args.turn else '--test-street',str(calibration)]
+            if args.turn: command.append(args.turn)
+            command.append(str(args.power))
             with log.open('x') as output:
                 process=subprocess.Popen(['stdbuf','-oL','-eL',*command],stdout=output,stderr=subprocess.STDOUT)
                 try:
@@ -62,7 +66,8 @@ def main():
             text=log.read_text()
             print(text,flush=True)
             matches=re.findall(r'STREET_RESULT,([a-z_]+)',text)
-            outcome=matches[-1] if matches else 'interrupted_or_setup_error'
+            turns=re.findall(r'TURN_RESULT,([a-z_]+)',text)
+            outcome=matches[-1] if matches else 'turn_'+turns[-1] if turns else 'interrupted_or_setup_error'
             operator='unverified'
             if not args.start_now:
                 try:
@@ -71,9 +76,9 @@ def main():
                 operator='confirmed' if response=='y' and outcome=='yellow_detected' else 'failed' if response=='n' else 'unverified'
             else: response='q'
             passed+=operator=='confirmed'
-            writer.writerow([trial,args.power,process.returncode,outcome,operator,text.count('Black lost ('),str(log)])
+            writer.writerow([trial,args.power,args.turn or 'straight',process.returncode,outcome,operator,text.count('Black lost ('),str(log)])
             stream.flush()
-            if outcome in ('brake_failed','interrupted_or_setup_error') or response=='q': break
+            if outcome in ('brake_failed','turn_brake_failed','interrupted_or_setup_error') or response=='q': break
             time.sleep(1)
     print(f'Operator-confirmed successes: {passed}. Summary: {summary}',flush=True)
     return 0

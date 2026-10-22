@@ -63,13 +63,20 @@ static long elapsed_ms(const struct timespec *start);
 static int follow_black_street(void);
 static int wiggle_to_black(void);
 static int center_on_alignment_marker(int marker_colour);
+static int center_on_alignment_marker_or_yellow(int marker_colour,int accept_yellow);
 static int window_wipe_for_colour(int target_colour);
 static int sample_alignment_colour(void);
 static int read_wheel_degrees(int *right,int *left);
 static int continuous_black_sweep(int *readings,int sample_count,int *final_angle);
+static int intersection_black_sweep(int *readings,int sample_count,int *final_angle);
+static int center_turn_to_heading(int target);
 static int continuous_recovery_sweep(void);
 static MoveResult turn_in_place_alignment(int angle_degrees,int turn_direction,int timeout_ms);
 static int next_follow_alignment_colour=1;
+// A scan leaves the axle over yellow; a street arrival leaves only the sensor there.
+static int intersection_axle_centered=0;
+// Only the first intersection search may accept yellow without a black departure.
+static int acquiring_first_intersection=0;
 static int street_follow_power=10;
 static int street_test_main(int argc,char **argv);
 static int geometry_check_main(int argc,char **argv);
@@ -86,7 +93,13 @@ static int geometry_check_main(int argc,char **argv);
 #define RECOVERY_SWEEP_RIGHT_DEGREES 40
 #define RECOVERY_SWEEP_LEFT_DEGREES 80
 #define ROAD_CENTER_STEP_DEGREES 5
-#define ROAD_CENTER_MAX_SWEEP_DEGREES 40
+#define ROAD_CENTER_MAX_SWEEP_DEGREES 30
+#define INTERSECTION_SWEEP_STEP_DEGREES 5
+#define INTERSECTION_SWEEP_COARSE_STEP_DEGREES 10
+#define INTERSECTION_SWEEP_FINE_WINDOW_DEGREES 20
+#define INTERSECTION_CROSSING_TOLERANCE_DEGREES 25
+#define INTERSECTION_SWEEP_MAX_DEGREES 405
+#define INTERSECTION_SWEEP_TIMEOUT_MS 180000
 #define FIND_STREET_MAX_REV 1.1
 #define FIND_STREET_TIMEOUT_MS 22000
 #define ALIGNMENT_TURN_OVERSHOOT_DEGREES 0
@@ -106,7 +119,8 @@ int main(int argc,char *argv[])
  sx=0;
  sy=0;
 
- if (argc>1 && strcmp(argv[1],"--test-street")==0) return street_test_main(argc,argv);
+ if (argc>1 && (strcmp(argv[1],"--test-street")==0||strcmp(argv[1],"--test-turn-street")==0))
+  return street_test_main(argc,argv);
  if (argc>1 && strcmp(argv[1],"--check-geometry")==0) return geometry_check_main(argc,argv);
 
  if (argc<4)
@@ -466,6 +480,7 @@ int turn_at_intersection(int turn_direction)
 
   int scan_intersection(int *tl,int *tr,int *br,int *bl)
   {
+   intersection_axle_centered=0;
    if (tl==NULL||tr==NULL||br==NULL||bl==NULL) return 0;
    *tl=*tr=*br=*bl=-1;
    int initial_colour=sample_alignment_colour();
@@ -500,11 +515,10 @@ int turn_at_intersection(int turn_direction)
    const int sample_count=ALIGN_SWEEP_TOTAL_DEGREES/ALIGN_SWEEP_STEP_DEGREES;
    int readings[ALIGN_SWEEP_TOTAL_DEGREES/ALIGN_SWEEP_STEP_DEGREES]={0};
    int final_angle;
-  if (continuous_black_sweep(readings,sample_count,&final_angle)!=0) return 0;
+  if (intersection_black_sweep(readings,sample_count,&final_angle)!=0) return 0;
    const int headings[]={315,45,135,225};
    const char *labels[]={"TL","TR","BR","BL"};
    int *outputs[]={tl,tr,br,bl};
-   int success=1;
    for (int corner=0;corner<4;corner++)
    {
     int counts[7]={0};
@@ -525,15 +539,16 @@ int turn_at_intersection(int turn_direction)
     }
     printf("Intersection %s at %d degrees: %s (%d/sector)\n",labels[corner],
       headings[corner],get_colour_name(selected),selected_count);
-    if (selected_count<1||selected_count==runner_up) success=0;
-    else *outputs[corner]=selected;
+    if (selected_count>0&&selected_count>runner_up) *outputs[corner]=selected;
    }
-   printf("Intersection sweep complete; gently reacquiring the starting black road.\n");
-   if (!wiggle_to_black()) return 0;
+   printf("Intersection sweep complete; starting street verified after four black crossings.\n");
    if (BT_read_gyro(GYRO_SENSOR_PORT,1,&gyro_angle,&gyro_rate)!=1) return 0;
    printf("Intersection relative readings: TL=%s TR=%s BL=%s BR=%s; gyro zero reset.\n",
      get_colour_name(*tl),get_colour_name(*tr),get_colour_name(*bl),get_colour_name(*br));
-   return success;
+   intersection_axle_centered=1;
+   // Success describes the physical sweep and restored street heading. Missing
+   // or tied building colours stay unknown and do not invalidate that heading.
+   return 1;
   }
 
 static int recover_from_red_boundary(void)
@@ -595,9 +610,9 @@ static int window_wipe_for_colour(int target_colour)
  if (colour<0) return -1;
  if ((target_colour==0&&(colour==1||colour==4||colour==5))||colour==target_colour) return colour;
 
- printf("Gentle recovery search: left then right in %d-degree steps, up to %d degrees per side.\n",
+ printf("Gentle recovery search: right then left in %d-degree steps, up to %d degrees per side.\n",
    ROAD_CENTER_STEP_DEGREES,ROAD_CENTER_MAX_SWEEP_DEGREES);
- for (int direction=1;direction>=0;direction--)
+ for (int direction=0;direction<2;direction++)
  {
   int turned=0;
   while (turned<ROAD_CENTER_MAX_SWEEP_DEGREES)
@@ -885,22 +900,44 @@ int robot_localization(int *robot_x, int *robot_y, int *direction)
  *robot_y=-1;
  *direction=0;
 
- if (!find_street()||!align_to_street()) return 0;
- *direction=0;
+ acquiring_first_intersection=0;
+ if (!find_street()) return 0;
+ int initial_colour=sample_alignment_colour();
+ if (initial_colour<0) return 0;
+ int initial_arrival=0;
+ if (initial_colour==4)
+ {
+  if (BT_motor_port_stop(MOTOR_B|MOTOR_C,1)!=0) return 0;
+  int confirmation=sample_alignment_colour();
+  if (confirmation<0) return 0;
+  if (confirmation==4)
+  {
+   initial_arrival=1;
+   printf("Initial yellow confirmed; scanning here without another street search.\n");
+  }
+ }
  int boundary_return=0;
- if (!drive_to_next_intersection(direction,&boundary_return)) return 0;
+ if (!initial_arrival)
+ {
+  if (!align_to_street()) return 0;
+  *direction=0;
+  acquiring_first_intersection=1;
+  initial_arrival=drive_to_next_intersection(direction,&boundary_return);
+  acquiring_first_intersection=0;
+  if (!initial_arrival) return 0;
+ }
  printf("First yellow intersection establishes relative orientation 0.\n");
 
  const int max_scans=24;
  const double minimum_ratio=10.0;
- int expected_index=-1,expected_heading=-1;
- const int dx[4]={0,1,0,-1},dy[4]={-1,0,1,0};
+ const double minimum_probability=0.70;
+ const double probability_backed_ratio=5.0;
  for (int intersection=0;intersection<max_scans;intersection++)
  {
   int tl=-1,tr=-1,br=-1,bl=-1;
-  int complete_scan=scan_intersection(&tl,&tr,&br,&bl);
-  if (!complete_scan)
-   fprintf(stderr,"Intersection %d scan incomplete; using available corner readings.\n",
+  int heading_verified=scan_intersection(&tl,&tr,&br,&bl);
+  if (!heading_verified)
+   fprintf(stderr,"Intersection %d heading unverified; using available corner readings without confirming a pose.\n",
      intersection+1);
   printf("Intersection %d relative readings: TL=%s TR=%s BL=%s BR=%s\n",
     intersection+1,get_colour_name(tl),get_colour_name(tr),
@@ -941,19 +978,21 @@ int robot_localization(int *robot_x, int *robot_y, int *direction)
   int valid_corners=0;
   for (int corner=0;corner<4;corner++)
    if (observed[corner]==2||observed[corner]==3||observed[corner]==6) valid_corners++;
-  int confident=complete_scan&&valid_corners==4&&best_probability>0.0&&ratio>=minimum_ratio;
-  // Confirm the previous leading pose after accounting for the completed motion.
-  // No minimum absolute belief is required; ties and incomplete scans cannot confirm.
-  if (confident&&best_index==expected_index&&best_heading==expected_heading)
+  printf("Scan heading: %s; valid building corners: %d/4.\n",
+    heading_verified ? "verified" : "unverified",valid_corners);
+  int clear_lead=ratio>=minimum_ratio||
+    (best_probability>minimum_probability&&ratio>=probability_backed_ratio);
+  int confident=heading_verified&&best_probability>0.0&&clear_lead;
+  // Use accumulated position/heading belief, including evidence from earlier scans.
+  // Missing colours do not block confirmation; an unverified physical heading does.
+  if (confident)
   {
    *robot_x=best_index%sx;
    *robot_y=best_index/sx;
    *direction=best_heading;
-   printf("Relative confidence confirmed on consecutive scans.\n");
+   printf("Relative confidence confirmed with verified heading (%d/4 building corners).\n",valid_corners);
    return 1;
   }
-  expected_index=confident ? best_index : -1;
-  expected_heading=confident ? best_heading : -1;
 
   if (intersection+1==max_scans) break;
 
@@ -972,8 +1011,6 @@ int robot_localization(int *robot_x, int *robot_y, int *direction)
     return 0;
    }
    *direction=(*direction+(turn_direction==0 ? 1 : 3))%4;
-   if (expected_index>=0)
-    expected_heading=(expected_heading+(turn_direction==0 ? 1 : 3))%4;
   }
   if (!drive_to_next_intersection(direction,&boundary_return)) return 0;
   if (!update_beliefs_after_forward(boundary_return))
@@ -981,19 +1018,10 @@ int robot_localization(int *robot_x, int *robot_y, int *direction)
    fprintf(stderr,"Forward belief update failed.\n");
    return 0;
   }
-  if (expected_index>=0)
-  {
-   int x=expected_index%sx+dx[expected_heading];
-   int y=expected_index/sx+dy[expected_heading];
-   int outside=x<0||x>=sx||y<0||y>=sy;
-   if (boundary_return&&outside) expected_heading=(expected_heading+2)%4;
-   else if (!boundary_return&&!outside) expected_index=y*sx+x;
-   else expected_index=-1; // The observed trip contradicts this candidate.
-  }
  }
 
- fprintf(stderr,"Localization did not achieve a consistent %.0fx lead within %d scans.\n",
-         minimum_ratio,max_scans);
+ fprintf(stderr,"Localization did not achieve sufficient belief with a verified heading within %d scans.\n",
+         max_scans);
  return 0;
 }
 
@@ -1006,6 +1034,26 @@ int heading_toward_target(int x, int y, int target_x, int target_y)
  if (target_y>y) return 2;
  if (target_y<y) return 0;
  return -1;
+}
+
+static int prepare_navigation_intersection(void)
+{
+ // Successful scans already positioned the axle. Ordinary arrivals have not.
+ if (intersection_axle_centered) return 1;
+ if (sample_alignment_colour()!=4||!center_on_alignment_marker(4))
+ {
+  fprintf(stderr,"Navigation requires a verified yellow intersection before positioning the axle.\n");
+  return 0;
+ }
+ MoveResult advance=move_forward_until(NULL,0,ALIGNMENT_AXIS_ADVANCE_REV,5000);
+ if (advance.reason!=STOP_DISTANCE)
+ {
+  report_move_result("navigation: position axle over yellow",advance);
+  return 0;
+ }
+ intersection_axle_centered=1;
+ printf("Navigation axle positioned over the yellow intersection.\n");
+ return 1;
 }
 
 NavigationStepResult navigate_one_step(int *robot_x, int *robot_y, int *direction,
@@ -1030,6 +1078,7 @@ NavigationStepResult navigate_one_step(int *robot_x, int *robot_y, int *directio
  // Check the planned edge before issuing any motor commands.
  if (next_x<0||next_x>=sx||next_y<0||next_y>=sy) return NAV_STEP_ERROR;
 
+ if (!prepare_navigation_intersection()) goto navigation_lost;
  if (turn==1||turn==3)
  {
   if (!turn_at_intersection(turn==1 ? 0 : 1)) goto navigation_lost;
@@ -1043,18 +1092,20 @@ NavigationStepResult navigate_one_step(int *robot_x, int *robot_y, int *directio
    goto navigation_lost;
   }
  }
- *direction=desired;
-
  // Use the direct street follower: unexpected red must not trigger exploration's
  // boundary turnaround or be counted as arrival at the planned intersection.
+ // It verifies outgoing black before driving; a gyro turn alone does not commit the pose.
+ next_follow_alignment_colour=1;
  if (drive_along_street()!=1) goto navigation_lost;
 
  *robot_x=next_x;
  *robot_y=next_y;
+ *direction=desired;
  printf("Navigation reached (%d, %d), heading %d.\n",next_x,next_y,desired);
  return next_x==target_x&&next_y==target_y ? NAV_STEP_ARRIVED : NAV_STEP_MOVED;
 
 navigation_lost:
+ intersection_axle_centered=0;
  // A failed turn or trip can leave the robot between discrete map states.
  *robot_x=-1;
  *robot_y=-1;
@@ -1126,6 +1177,7 @@ int run_mission(int target_x, int target_y, int max_relocalizations)
     beliefs[index][heading]=1.0/(double)(sx*sy*4);
   reset_sensor_color_filter();
   next_follow_alignment_colour=1;
+  intersection_axle_centered=0;
   int robot_x=-1,robot_y=-1,direction=-1;
   if (robot_localization(&robot_x,&robot_y,&direction))
   {
@@ -1239,6 +1291,7 @@ static int colour_calibration_samples[6][CALIBRATION_SAMPLES_PER_COLOUR][3];
 static int colour_calibration_loaded=0;
 static double hsv_neutral_saturation_threshold=0.0;
 static double hsv_black_white_value_threshold=0.0;
+static double hsv_black_value_threshold=-1.0;
 static int confirmed_colour=0;               // Last colour confirmed by three consecutive readings.
 static int candidate_colour=0;               // Colour currently accumulating a confirmation streak.
 static int candidate_count=0;                // Consecutive matches, capped at three.
@@ -1277,6 +1330,7 @@ int load_colour_calibration(const char *directory)
 {
  // Load six complete NXT captures for calibrated HSV classification.
  colour_calibration_loaded=0;
+ hsv_black_value_threshold=-1.0;
  reset_sensor_color_filter();
  for (int colour_index=0;colour_index<6;colour_index++)
  {
@@ -1319,6 +1373,7 @@ int load_colour_calibration(const char *directory)
  double neutral_saturation_max=0.0;
  double chromatic_saturation_min=1.0;
  double black_value_max=0.0;
+ double nonblack_value_min=HUGE_VAL;
  double white_value_min=1.0;
  for (int colour_index=0;colour_index<6;colour_index++)
   for (int sample=0;sample<CALIBRATION_SAMPLES_PER_COLOUR;sample++)
@@ -1326,6 +1381,7 @@ int load_colour_calibration(const char *directory)
    double hue,saturation,value;
    rgb_to_hsv(colour_calibration_samples[colour_index][sample],&hue,&saturation,&value);
    int colour=calibration_map_ids[colour_index];
+   if (colour!=1&&value<nonblack_value_min) nonblack_value_min=value;
    if (colour==1||colour==6)
    {
     if (saturation>neutral_saturation_max) neutral_saturation_max=saturation;
@@ -1337,6 +1393,10 @@ int load_colour_calibration(const char *directory)
   }
  hsv_neutral_saturation_threshold=(neutral_saturation_max+chromatic_saturation_min)/2.0;
  hsv_black_white_value_threshold=(black_value_max+white_value_min)/2.0;
+ // Low NXT readings can have a strong channel tint even on black. Use brightness
+ // before hue/saturation only when the captures demonstrate a black/nonblack gap.
+ if (black_value_max<nonblack_value_min)
+  hsv_black_value_threshold=(black_value_max+nonblack_value_min)/2.0;
 
  // Enable classification only after all six NXT captures and their HSV thresholds validate.
  colour_calibration_loaded=1;
@@ -1349,6 +1409,7 @@ static int classify_sensor_rgb(const int channels[3])
  if (!colour_calibration_loaded) return 0;
  double hue,saturation,value;
  rgb_to_hsv(channels,&hue,&saturation,&value);
+ if (hsv_black_value_threshold>=0.0&&value<hsv_black_value_threshold) return 1;
  if (saturation<=hsv_neutral_saturation_threshold)
   return value<hsv_black_white_value_threshold ? 1 : 6;
 
@@ -1406,22 +1467,32 @@ static int read_sensor_colour_unfiltered(void)
  return classify_sensor_rgb(rgb);
 }
 
-static int sample_colour_agreement(int required_votes)
+static int sample_colour_agreement_mode(int required_votes,int early_exit)
 {
  int counts[7]={0};
+ int samples_taken=0;
  for (int sample=0;sample<5;sample++)
  {
   int colour=read_sensor_colour_unfiltered();
   if (colour<0) return -1;
   if (colour>=1&&colour<=6) counts[colour]++;
+  samples_taken++;
+  // Four matching votes already satisfy the four-of-five scan rule; the
+  // remaining vote cannot change the result. Keep errors on reads we do take.
+  if (early_exit&&colour>=1&&colour<=6&&counts[colour]>=required_votes) break;
   if (sample<4) usleep(20000);
  }
  int best_colour=0;
  for (int colour=1;colour<=6;colour++)
   if (counts[colour]>counts[best_colour]) best_colour=colour;
- printf("Alignment sample: %s (%d), %d/5\n",get_colour_name(best_colour),best_colour,counts[best_colour]);
+ printf("Alignment sample: %s (%d), %d/%d\n",get_colour_name(best_colour),best_colour,counts[best_colour],samples_taken);
  fflush(stdout);
  return counts[best_colour]>=required_votes ? best_colour : 0;
+}
+
+static int sample_colour_agreement(int required_votes)
+{
+ return sample_colour_agreement_mode(required_votes,0);
 }
 
 static int sample_stable_colour(void)
@@ -1478,6 +1549,125 @@ static int sample_sweep_colour(void)
  printf("Sweep sample: %s (%d), %d/5\n",get_colour_name(best_colour),best_colour,best_count);
  fflush(stdout);
  return best_count>=required_votes&&best_count>runner_up ? best_colour : 0;
+}
+
+static int sample_intersection_colour(void)
+{
+ return sample_colour_agreement_mode(4,1);
+}
+
+typedef struct
+{
+ int crossings,in_black,nonblack_run;
+ int entry_angle,last_black_angle;
+} IntersectionCrossings;
+
+static int intersection_sweep_step(int angle,const IntersectionCrossings *state)
+{
+ int offset=angle%90;
+ int distance=offset<45 ? offset : 90-offset;
+ int next_offset=(angle+INTERSECTION_SWEEP_COARSE_STEP_DEGREES)%90;
+ int next_distance=next_offset<45 ? next_offset : 90-next_offset;
+ // Keep fine probes around each road and throughout a black strip. Once the
+ // final road is found, retain fine resolution until its exit is confirmed.
+ if (state->in_black||state->crossings==4||distance<=INTERSECTION_SWEEP_FINE_WINDOW_DEGREES||
+     next_distance<=INTERSECTION_SWEEP_FINE_WINDOW_DEGREES)
+  return INTERSECTION_SWEEP_STEP_DEGREES;
+ return INTERSECTION_SWEEP_COARSE_STEP_DEGREES;
+}
+
+static int observe_intersection_crossing(IntersectionCrossings *state,int angle,int colour)
+{
+ // Unknown readings cannot establish departure from a street. Two confirmed
+ // nonblack stops are needed before another black interval can be counted.
+ if (colour==0) {state->nonblack_run=0;return 0;}
+ if (colour==1)
+ {
+  state->nonblack_run=0;
+  if (!state->in_black)
+  {
+   state->in_black=1;
+   state->entry_angle=angle;
+   int expected=(state->crossings+1)*90;
+   if (state->crossings<4&&abs(angle-expected)<=INTERSECTION_CROSSING_TOLERANCE_DEGREES)
+    state->crossings++;
+  }
+  state->last_black_angle=angle;
+  return 0;
+ }
+ if (state->in_black&&++state->nonblack_run>=2)
+ {
+  state->in_black=0;
+  state->nonblack_run=0;
+  return state->crossings==4;
+ }
+ return 0;
+}
+
+static int intersection_black_sweep(int *readings,int sample_count,int *final_angle)
+{
+ const int bins=ALIGN_SWEEP_TOTAL_DEGREES/ALIGN_SWEEP_STEP_DEGREES;
+ if (readings==NULL||final_angle==NULL||sample_count!=bins) return -1;
+ int votes[ALIGN_SWEEP_TOTAL_DEGREES/ALIGN_SWEEP_STEP_DEGREES][7]={{0}};
+ for (int index=0;index<sample_count;index++) readings[index]=0;
+ int success=0,angle,rate;
+ struct timespec start;
+ clock_gettime(CLOCK_MONOTONIC,&start);
+ IntersectionCrossings state={0,1,0,0,0};
+ if (BT_read_gyro(GYRO_SENSOR_PORT,1,&angle,&rate)!=1) goto done;
+ if (sample_intersection_colour()!=1)
+ {
+  fprintf(stderr,"Counted intersection sweep must start on confirmed black.\n");
+  goto done;
+ }
+ readings[0]=1;
+ votes[0][1]=1;
+ for (int target=INTERSECTION_SWEEP_STEP_DEGREES;target<=INTERSECTION_SWEEP_MAX_DEGREES;
+      target+=intersection_sweep_step(target,&state))
+ {
+  if (elapsed_ms(&start)>=INTERSECTION_SWEEP_TIMEOUT_MS)
+  {
+   fprintf(stderr,"Counted intersection sweep timed out.\n");
+   break;
+  }
+  // Absolute targets retain the scan's gyro reference across every small turn.
+  // Stop to sample, so Bluetooth latency cannot sweep past a narrow street.
+  if (!center_turn_to_heading(target)||BT_read_gyro(GYRO_SENSOR_PORT,0,&angle,&rate)!=1) break;
+  int colour=sample_intersection_colour();
+  if (colour<0) break;
+  int index=(int)lround((double)angle/ALIGN_SWEEP_STEP_DEGREES)%sample_count;
+  if (index<0) break;
+  if (colour>=1&&colour<=6) votes[index][colour]++;
+  int best=0,best_count=0,runner_up=0;
+  for (int candidate=1;candidate<=6;candidate++)
+  {
+   int count=votes[index][candidate];
+   if (count>best_count) {runner_up=best_count;best_count=count;best=candidate;}
+   else if (count>runner_up) runner_up=count;
+  }
+  readings[index]=best_count>runner_up ? best : 0;
+  printf("Intersection sweep: gyro %d degrees, %s (%d)\n",angle,get_colour_name(colour),colour);
+  int previous=state.crossings;
+  int complete=observe_intersection_crossing(&state,angle,colour);
+  if (state.crossings!=previous)
+   printf("Black street crossing %d/4 at %d degrees.\n",state.crossings,angle);
+  if (!complete) continue;
+  int midpoint=(state.entry_angle+state.last_black_angle)/2;
+  if (abs(midpoint-360)>INTERSECTION_CROSSING_TOLERANCE_DEGREES) break;
+  printf("Fourth black street spans %d..%d degrees; returning to midpoint %d.\n",
+    state.entry_angle,state.last_black_angle,midpoint);
+  if (!center_turn_to_heading(midpoint)||BT_read_gyro(GYRO_SENSOR_PORT,0,&angle,&rate)!=1||
+      abs(angle-360)>INTERSECTION_CROSSING_TOLERANCE_DEGREES||sample_intersection_colour()!=1) break;
+  *final_angle=angle;
+  success=1;
+  break;
+ }
+done:
+ if (BT_motor_port_stop(MOTOR_B|MOTOR_C,1)!=0) return -1;
+ if (!success)
+  fprintf(stderr,"Intersection sweep failed to verify the starting street after four crossings (%d/4).\n",
+    state.crossings);
+ return success ? 0 : -1;
 }
 
 static int continuous_black_sweep(int *readings,int sample_count,int *final_angle)
@@ -1817,17 +2007,16 @@ static MoveResult drive_straight(int direction,const int *stop_colours,int colou
  }
 }
 
-static MoveResult rotate_gyro_with_power_limits(int wheels,int turn_right,int angle_degrees,
+static MoveResult rotate_gyro_to_target(int wheels,int target,int reset_gyro,
                                                 const int *stop_colours,int colour_count,
                                                 int timeout_ms,int min_power,int max_power)
 {
  MoveResult failed={STOP_ERROR,0};
- if (angle_degrees<1||angle_degrees>360||movement_setup(stop_colours,colour_count)!=0) return failed;
+ if ((reset_gyro&&(abs(target)<1||abs(target)>360))||movement_setup(stop_colours,colour_count)!=0) return failed;
  // A turn always has a bound, so a dead gyro cannot spin the robot forever.
  if (timeout_ms<=0) timeout_ms=TURN_DEFAULT_TIMEOUT_MS;
  int angle,rate;
- if (BT_read_gyro(GYRO_SENSOR_PORT,1,&angle,&rate)!=1) return failed;
- int target=turn_right ? angle_degrees : -angle_degrees;
+ if (BT_read_gyro(GYRO_SENSOR_PORT,reset_gyro,&angle,&rate)!=1) return failed;
  struct timespec start;
  clock_gettime(CLOCK_MONOTONIC,&start);
  for (;;)
@@ -1864,6 +2053,23 @@ static MoveResult rotate_gyro_with_power_limits(int wheels,int turn_right,int an
   int right=wheels!=ROTATE_LEFT_WHEEL ? -direction*magnitude : 0;
   if (BT_turn(MOTOR_C,left,MOTOR_B,right)!=0) return stop_with(STOP_ERROR,0);
  }
+}
+
+static MoveResult rotate_gyro_with_power_limits(int wheels,int turn_right,int angle_degrees,
+                                                const int *stop_colours,int colour_count,
+                                                int timeout_ms,int min_power,int max_power)
+{
+ MoveResult failed={STOP_ERROR,0};
+ if (angle_degrees<1||angle_degrees>360) return failed;
+ return rotate_gyro_to_target(wheels,turn_right ? angle_degrees : -angle_degrees,1,
+   stop_colours,colour_count,timeout_ms,min_power,max_power);
+}
+
+static int center_turn_to_heading(int target)
+{
+ MoveResult result=rotate_gyro_to_target(ROTATE_BOTH,target,0,NULL,0,10000,
+   TURN_MIN_POWER,TURN_MAX_POWER);
+ return result.reason==STOP_ANGLE;
 }
 
 static MoveResult rotate_gyro(int wheels,int turn_right,int angle_degrees,const int *stop_colours,
@@ -1936,10 +2142,16 @@ static int continuous_recovery_sweep(void)
 
 static int recover_black_heading(void)
 {
- printf("Line lost; stopping, sweeping left 30 degrees, then right through to +30 degrees.\n");
+ printf("Line lost; stopping, checking right before left within the bounded recovery range.\n");
  int result=continuous_recovery_sweep();
+ if (result==1) result=center_on_alignment_marker_or_yellow(1,1);
  if (result==4)
  {
+  if (BT_motor_port_stop(MOTOR_B|MOTOR_C,1)!=0||sample_alignment_colour()!=4)
+  {
+   fprintf(stderr,"Recovery yellow did not remain confirmed while stopped.\n");
+   return 0;
+  }
   printf("Yellow intersection found during recovery wiggle; stopping there.\n");
   return 4;
  }
@@ -1953,62 +2165,89 @@ static int recover_black_heading(void)
   fprintf(stderr,"Black line not found in the bounded recovery sweep.\n");
   return 0;
  }
- if (!center_on_alignment_marker(1)) return 0;
  int angle,rate;
  if (BT_read_gyro(GYRO_SENSOR_PORT,1,&angle,&rate)!=1) return 0;
  printf("Black reacquired; heading reset. Resuming forward.\n");
  return 1;
 }
 
-static int measure_marker_edge(int turn_direction,int marker_colour,int *edge_degrees,int *swept_degrees)
+static int sample_marker_alignment_colour(int accept_yellow)
+{
+ int colour=sample_alignment_colour();
+ if (!accept_yellow||colour!=4) return colour;
+ // Driving recovery may reach yellow while probing for black. Confirm while
+ // stopped rather than sweeping away from a possible intersection.
+ if (BT_motor_port_stop(MOTOR_B|MOTOR_C,1)!=0) return -1;
+ return sample_alignment_colour();
+}
+
+static int measure_marker_edge(int turn_direction,int marker_colour,int origin,int *edge_degrees,
+                               int accept_yellow)
 {
  int turned=0;
- int first_nonblack=0,nonblack_count=0;
+ int last_marker=0,nonblack_count=0;
  while (turned<ROAD_CENTER_MAX_SWEEP_DEGREES)
  {
-  MoveResult turn=turn_in_place(ROAD_CENTER_STEP_DEGREES,turn_direction,5000);
-  if (turn.reason!=STOP_ANGLE) return -1;
   turned+=ROAD_CENTER_STEP_DEGREES;
-  *swept_degrees=turned;
-  int colour=sample_alignment_colour();
+  if (!center_turn_to_heading(origin+(turn_direction==0 ? turned : -turned))) return -1;
+  int angle,rate;
+  if (BT_read_gyro(GYRO_SENSOR_PORT,0,&angle,&rate)!=1) return -1;
+  int colour=sample_marker_alignment_colour(accept_yellow);
   if (colour<0) return -1;
+  if (accept_yellow&&colour==4) return 4;
   if (colour==marker_colour)
   {
    nonblack_count=0;
+   last_marker=abs(angle-origin);
    continue;
   }
-  if (nonblack_count==0) first_nonblack=turned;
   nonblack_count++;
   if (nonblack_count==2)
   {
-   *edge_degrees=first_nonblack-ROAD_CENTER_STEP_DEGREES;
-   *swept_degrees=turned;
+   *edge_degrees=last_marker;
    return 1;
   }
  }
- *swept_degrees=turned;
  return 0;
 }
 
-static int center_on_alignment_marker(int marker_colour)
+static int restore_alignment_heading(int origin,int marker_colour,int accept_yellow)
 {
- int colour=sample_alignment_colour();
+ if (!center_turn_to_heading(origin)) return 0;
+ int colour=sample_marker_alignment_colour(accept_yellow);
+ if (accept_yellow&&colour==4) return 4;
+ if (colour!=marker_colour)
+ {
+  fprintf(stderr,"Restored heading did not verify %s; stopping alignment.\n",
+    get_colour_name(marker_colour));
+  return 0;
+ }
+ return 1;
+}
+
+// 1=centered, 0=failed, 4=confirmed yellow during driving recovery only.
+static int center_on_alignment_marker_or_yellow(int marker_colour,int accept_yellow)
+{
+ int origin,rate;
+ if (BT_read_gyro(GYRO_SENSOR_PORT,0,&origin,&rate)!=1) return 0;
+ int colour=sample_marker_alignment_colour(accept_yellow);
  if (colour<0) return 0;
+ if (accept_yellow&&colour==4) return 4;
  if (colour!=marker_colour)
  {
   printf("Searching gently for %s from %s before measuring its edges.\n",
     get_colour_name(marker_colour),get_colour_name(colour));
   int acquired=0;
-  for (int direction=1;direction>=0&&!acquired;direction--)
+  for (int direction=0;direction<2&&!acquired;direction++)
   {
    int turned=0;
    while (turned<ROAD_CENTER_MAX_SWEEP_DEGREES)
    {
-    MoveResult search_turn=turn_in_place(ROAD_CENTER_STEP_DEGREES,direction,10000);
-    if (search_turn.reason!=STOP_ANGLE) return 0;
     turned+=ROAD_CENTER_STEP_DEGREES;
-    colour=sample_alignment_colour();
+    if (!center_turn_to_heading(origin+(direction==0 ? turned : -turned))) return 0;
+    colour=sample_marker_alignment_colour(accept_yellow);
     if (colour<0) return 0;
+    if (accept_yellow&&colour==4) return 4;
     if (colour==marker_colour)
     {
      acquired=1;
@@ -2019,8 +2258,7 @@ static int center_on_alignment_marker(int marker_colour)
    }
    if (!acquired&&turned>0)
    {
-    MoveResult restore=turn_in_place(turned,direction==1 ? 0 : 1,10000);
-    if (restore.reason!=STOP_ANGLE) return 0;
+    if (!center_turn_to_heading(origin)) return 0;
    }
   }
   if (!acquired)
@@ -2031,58 +2269,62 @@ static int center_on_alignment_marker(int marker_colour)
   }
  }
 
- int left_edge=0,left_swept=0;
- int left_status=measure_marker_edge(1,marker_colour,&left_edge,&left_swept);
- if (left_swept>0)
+ // Keep one gyro reference throughout: resetting it for each small relative
+ // turn accumulates tolerance error and can leave the robot off the street.
+ if (BT_read_gyro(GYRO_SENSOR_PORT,0,&origin,&rate)!=1) return 0;
+ int right_edge=0;
+ int right_status=measure_marker_edge(0,marker_colour,origin,&right_edge,accept_yellow);
+ if (right_status==4) return 4;
+ if (right_status<0) return 0;
+ int restored=restore_alignment_heading(origin,marker_colour,accept_yellow);
+ if (restored!=1) return restored;
+ if (right_status==0)
  {
-  MoveResult restore=turn_in_place(left_swept,0,10000);
-  if (restore.reason!=STOP_ANGLE) return 0;
- }
- if (left_status<0) return 0;
- if (left_status==0)
- {
-  printf("Could not find the left edge of %s within %d degrees; keeping current heading.\n",
-    get_colour_name(marker_colour),ROAD_CENTER_MAX_SWEEP_DEGREES);
-  return 1;
- }
-
- int right_edge=0,right_swept=0;
- int right_status=measure_marker_edge(0,marker_colour,&right_edge,&right_swept);
- if (right_status!=1)
- {
-  if (right_swept>0)
-  {
-   MoveResult restore=turn_in_place(right_swept,1,20000);
-   if (restore.reason!=STOP_ANGLE) return 0;
-  }
-  if (right_status<0) return 0;
   printf("Could not find the right edge of %s within %d degrees; keeping current heading.\n",
     get_colour_name(marker_colour),ROAD_CENTER_MAX_SWEEP_DEGREES);
   return 1;
  }
 
- int center_offset=(right_edge-left_edge)/2;
- int correction=center_offset-right_swept;
- printf("%s bounds: left -%d, right +%d degrees; centering by %d degrees.\n",
-   get_colour_name(marker_colour),left_edge,right_edge,abs(correction));
- if (correction!=0)
+ int left_edge=0;
+ int left_status=measure_marker_edge(1,marker_colour,origin,&left_edge,accept_yellow);
+ if (left_status==4) return 4;
+ if (left_status!=1)
  {
-  MoveResult center=turn_in_place(abs(correction),correction>0 ? 0 : 1,20000);
-  if (center.reason!=STOP_ANGLE) return 0;
+  if (left_status<0) return 0;
+  restored=restore_alignment_heading(origin,marker_colour,accept_yellow);
+  if (restored!=1) return restored;
+  printf("Could not find the left edge of %s within %d degrees; keeping current heading.\n",
+    get_colour_name(marker_colour),ROAD_CENTER_MAX_SWEEP_DEGREES);
+  return 1;
  }
- if (sample_alignment_colour()!=marker_colour)
+
+ int center_offset=(right_edge-left_edge)/2;
+ printf("%s bounds: left -%d, right +%d degrees; midpoint offset %d degrees.\n",
+   get_colour_name(marker_colour),left_edge,right_edge,center_offset);
+ if (!center_turn_to_heading(origin+center_offset)) return 0;
+ colour=sample_marker_alignment_colour(accept_yellow);
+ if (colour<0) return 0;
+ if (accept_yellow&&colour==4) return 4;
+ if (colour!=marker_colour)
  {
-  fprintf(stderr,"Marker midpoint did not verify %s; using target-color wipe.\n",
+  fprintf(stderr,"Marker midpoint did not verify %s; restoring entry heading.\n",
     get_colour_name(marker_colour));
-  if (window_wipe_for_colour(marker_colour)!=marker_colour) return 0;
+  return restore_alignment_heading(origin,marker_colour,accept_yellow);
  }
  else
   printf("Centered on %s marker.\n",get_colour_name(marker_colour));
  return 1;
 }
 
+static int center_on_alignment_marker(int marker_colour)
+{
+ return center_on_alignment_marker_or_yellow(marker_colour,0)==1;
+}
+
 static int follow_black_street(void)
 {
+ // Leaving an intersection invalidates the axle placement, even if the trip fails.
+ intersection_axle_centered=0;
  const double max_forward_revolutions=2;
  const int timeout_ms=60000;
  const int follow_power=street_follow_power;
@@ -2090,11 +2332,20 @@ static int follow_black_street(void)
  int angle,rate,right_previous,left_previous;
  int alignment_colour=next_follow_alignment_colour;
  next_follow_alignment_colour=1;
- if (!center_on_alignment_marker(alignment_colour)) return 0;
+ int alignment_result=acquiring_first_intersection ?
+   center_on_alignment_marker_or_yellow(alignment_colour,1) :
+   center_on_alignment_marker(alignment_colour);
+ if (alignment_result==4)
+ {
+  printf("Initial yellow confirmed during alignment; using it as the first intersection.\n");
+  return 1;
+ }
+ if (alignment_result!=1) return 0;
  if (movement_setup(NULL,0)!=0||BT_read_gyro(GYRO_SENSOR_PORT,1,&angle,&rate)!=1||
    read_wheel_degrees(&right_previous,&left_previous)!=0) return 0;
  double forward_revolutions=0;
- int last_healthy_colour=1;
+ int last_healthy_colour=alignment_colour;
+ int observed_black=0;
  struct timespec start;
  clock_gettime(CLOCK_MONOTONIC,&start);
  printf("Following black street until yellow or red.\n");
@@ -2124,15 +2375,23 @@ static int follow_black_street(void)
   }
 
   int colour=sample_street_event_colour();
+  // Later trips require a black departure. The initial search needs only a
+  // confirmed yellow anchor; it does not claim an intersection-to-intersection move.
+  if (colour==1) observed_black=1;
   if (colour==0)
   {
    colour=last_healthy_colour;
    printf("Unknown street reading; retaining last healthy colour %s.\n",
      get_colour_name(last_healthy_colour));
   }
-  if (colour==4)
+  if (colour==4&&(observed_black||acquiring_first_intersection))
   {
-   stop_with(STOP_COLOUR,colour);
+   if (BT_motor_port_stop(MOTOR_B|MOTOR_C,1)!=0) return 0;
+   if (acquiring_first_intersection&&sample_alignment_colour()!=4)
+   {
+    fprintf(stderr,"Initial yellow did not remain confirmed while stopped.\n");
+    return 0;
+   }
     printf("Intersection reached; stopped on yellow.\n");
     return 1;
   }
@@ -2142,9 +2401,10 @@ static int follow_black_street(void)
    printf("Red boundary reached.\n");
    return 2;
   }
-  if (colour==1)
+  if (colour==1||colour==4)
   {
     last_healthy_colour=colour;
+    if (colour==4) printf("Leaving starting yellow; waiting for black before accepting an intersection.\n");
     // Stay on the gyro-held heading while the sensor confirms the road.
   }
   else
@@ -2158,7 +2418,12 @@ static int follow_black_street(void)
     if (BT_motor_port_stop(MOTOR_B|MOTOR_C,1)!=0) return 0;
     printf("Black lost (%s); starting bounded left/right wiggle.\n",get_colour_name(colour));
     int recovery= recover_black_heading();
-    if (recovery==4) return 1;
+    if (recovery==4)
+    {
+     if (observed_black||acquiring_first_intersection) return 1;
+     fprintf(stderr,"Recovery found yellow before a black street departure; trip unconfirmed.\n");
+     return 0;
+    }
     if (recovery==5) return 2;
     if (recovery!=1) return 0;
     if (read_wheel_degrees(&right_previous,&left_previous)!=0)
@@ -2189,7 +2454,7 @@ static int follow_black_street(void)
 // One-segment diagnostics use the real street follower, with no exploration or
 // boundary turnaround. Yellow is a sensor outcome; the operator must verify
 // it is the intended next intersection rather than the starting intersection.
-static int run_street_segment_test(void)
+static int street_test_preflight(void)
 {
  if (BT_motor_port_stop(MOTOR_B|MOTOR_C,1)!=0) return 0;
  int angle,rate,minimum=INT_MAX,maximum=INT_MIN;
@@ -2212,6 +2477,12 @@ static int run_street_segment_test(void)
   fprintf(stderr,"STREET_RESULT,invalid_start\nStart on black just beyond yellow; saw %s.\n",get_colour_name(initial_colour));
   return 0;
  }
+ return 1;
+}
+
+static int run_street_segment_test(void)
+{
+ if (!street_test_preflight()) return 0;
  int right0,left0,right1,left1;
  if (read_wheel_degrees(&right0,&left0)!=0) return 0;
  printf("Street test: power %d; sensor offset %.6f wheel revolutions (configured, not measured).\n",
@@ -2236,19 +2507,60 @@ static int run_street_segment_test(void)
  return brake_ok&&encoders_ok&&result==1&&final_colour==4;
 }
 
+static int run_turn_street_test(int direction)
+{
+ if (!street_test_preflight()) return 0;
+ printf("Turn test: %s 90 degrees from a manually centered axle.\n",direction==0 ? "right" : "left");
+ fflush(stdout);
+ MoveResult result=turn_in_place(90,direction,10000);
+ int brake_ok=BT_motor_port_stop(MOTOR_B|MOTOR_C,1)==0;
+ if (result.reason!=STOP_ANGLE||!brake_ok)
+ {
+  printf("TURN_RESULT,%s\n",brake_ok ? "turn_failed" : "brake_failed");
+  return 0;
+ }
+ int angle,rate;
+ if (BT_read_gyro(GYRO_SENSOR_PORT,0,&angle,&rate)!=1)
+ {
+  puts("TURN_RESULT,gyro_error");
+  return 0;
+ }
+ printf("TURN_GYRO_DEGREES,%d\n",angle);
+ // Inspect the result before allowing any centering/recovery to hide a bad turn.
+ int colour=sample_alignment_colour();
+ printf("Turn exit sensor: %s (%d).\n",get_colour_name(colour),colour);
+ if (colour!=1)
+ {
+  puts("TURN_RESULT,not_on_black");
+  return 0;
+ }
+ puts("TURN_RESULT,black_aligned");
+ return run_street_segment_test();
+}
+
 static int street_test_main(int argc,char **argv)
 {
- if (argc!=3&&argc!=4)
+ int turning=strcmp(argv[1],"--test-turn-street")==0;
+ int required=turning ? 4 : 3;
+ if (argc!=required&&argc!=required+1)
  {
   fprintf(stderr,"Usage: EV3_Localization --test-street calibration_directory [power 1..20]\n");
+  fprintf(stderr,"       EV3_Localization --test-turn-street calibration_directory left|right [power 1..20]\n");
   return 1;
  }
- if (argc==4)
+ int direction=-1;
+ if (turning)
+ {
+  if (strcmp(argv[3],"right")==0) direction=0;
+  else if (strcmp(argv[3],"left")==0) direction=1;
+  else return 1;
+ }
+ if (argc==required+1)
  {
   char *end;
   errno=0;
-  long power=strtol(argv[3],&end,10);
-  if (errno||end==argv[3]||*end||power<1||power>20) return 1;
+  long power=strtol(argv[required],&end,10);
+  if (errno||end==argv[required]||*end||power<1||power>20) return 1;
   street_follow_power=(int)power;
  }
  if (load_colour_calibration(argv[2])!=0)
@@ -2258,7 +2570,7 @@ static int street_test_main(int argc,char **argv)
  }
  if (BT_open(HEXKEY)!=0) return 1;
  int setup_ok=movement_setup(NULL,0)==0&&verify_nxt_colour_sensor()==0;
- int success=setup_ok&&run_street_segment_test();
+ int success=setup_ok&&(turning ? run_turn_street_test(direction) : run_street_segment_test());
  if (BT_motor_port_stop(MOTOR_B|MOTOR_C,1)!=0) success=0;
  BT_close();
  return success ? 0 : 1;

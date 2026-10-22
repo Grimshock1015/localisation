@@ -17,6 +17,8 @@
  * 
  * ********************************************************************************************************************/
 #include "btcomm.h"
+#include <stdint.h>
+#include <limits.h>
 					     
 //#define __BT_debug			// Uncomment to trigger printing of BT messages for debug purposes
 
@@ -1292,100 +1294,70 @@ int BT_read_colour_RGBraw_NXT(char sensor_port, int *R, int *G, int *B, int *A)
 }
 
 
-int BT_read_gyro(char sensor_port, int reset, int *angle, int *rate){
- ////////////////////////////////////////////////////////////////////////////////////////////////
- //
- // Updates the current angle and reate of change according to the gyro sensor on the robot. 
- // The angle is measured relative to the *last time the reference was set* - the reference is 
- // set by calling this function with the reset flag set to 1. So, to use the sensor, normally 
- // you would first reset the reference angle in this way, and then proceed to use the gyro sensor 
- // to measure the amount of turning relative to this reference.
- //
- // Like anything else, the sensor has drift, so some form of correction will be needed after
- // multiple successive readings. Using the sensor rate of change may be useful for this.
- //
- // Ports are identified as PORT_1, PORT_2, etc
- //
- // Inputs: port identifier of gyro sensor port
- //         reset flag, if NOT ZERO, then the reference angle is set to the current angle
- //         pointers to variables where we will store the angle and rate
- //
- // Returns: 1 on success
- //          -1 if EV3 returned an error response
- //////////////////////////////////////////////////////////////////////////////////////////////////
- void *p;
- unsigned char reply[1024];
- unsigned char *cp;
- int ang=0;
- int rat=0;
- int cmdlen;
- int replen;
-
- // Reset the reply message buffer
- memset(&reply[0],0,1024);
- 
- // Pre-defined command sequence for reading the gyro sensor's angle and rate 
- unsigned char CMD_READ_GYRO_ANGRATE[17]={0x0F,0x00,0x00,0x00,0x00,0x80,0x00,0x99,0x1C,0x00,0x01,0x81,0x20,0x03,0x02,0x60,0x64};
-
- cmdlen=CMD_READ_GYRO_ANGRATE[0]+2;
- unsigned char cmd_string[1024];
- memcpy(&cmd_string[0],&CMD_READ_GYRO_ANGRATE[0],cmdlen);
-
- if (sensor_port>4)
+int BT_read_gyro(char sensor_port, int reset, int *angle, int *rate)
+{
+ // Read the full framed reply before interpreting angle/rate. EV3 invalid-data
+ // sentinels must be rejected before resetting/subtracting the reference angle.
+ if (sensor_port<PORT_1||sensor_port>PORT_4||angle==NULL||rate==NULL||socket_id==NULL) return -1;
+ unsigned int message_id=(unsigned int)message_id_counter++ & 0xffff;
+ unsigned char command[17]={0x0f,0,0,0,0,8,0,opINPUT_DEVICE,READY_RAW,0,0,0x81,0x20,3,2,0x60,0x64};
+ command[2]=(unsigned char)message_id;
+ command[3]=(unsigned char)(message_id>>8);
+ command[10]=(unsigned char)sensor_port;
+ size_t transferred=0;
+ while (transferred<sizeof(command))
  {
-  fprintf(stderr,"BT_read_gyro_sensor(): Invalid port id value\n");
-  return(-1);
+  ssize_t count=write(*socket_id,command+transferred,sizeof(command)-transferred);
+  if (count<0&&errno==EINTR) continue;
+  if (count<=0) return -1;
+  transferred+=(size_t)count;
  }
-
- // Set message count id            // Message id count is kept in an int variable, but it has to be stuffed in little endian format, 
- p=(void *)&message_id_counter;     // so the code here stuffs the counter in the right order in the string, lowest byte first
- cp=(unsigned char *)p;
- cmd_string[2]=*(cp);
- cmd_string[3]=*(cp+1);
- cmd_string[10]=sensor_port;         // Port
-
-#ifdef __BT_debug
- fprintf(stderr,"BT_read_gyro_sensor() command string\n");
- for(int i=0; i<cmdlen; i++)
+ unsigned char length_bytes[2],reply[11];
+ transferred=0;
+ while (transferred<sizeof(length_bytes))
  {
-  fprintf(stderr,"%02X, ",cmd_string[i]);
+  ssize_t count=read(*socket_id,length_bytes+transferred,sizeof(length_bytes)-transferred);
+  if (count<0&&errno==EINTR) continue;
+  if (count<=0) return -1;
+  transferred+=(size_t)count;
  }
- fprintf(stderr,"\n");
-#endif
-
- write(*socket_id,&cmd_string[0],cmdlen);
- while(read(*socket_id,&reply[0],1023)==0);       // Wait for a reply!
- message_id_counter++;
- 
- if (reply[4]==0x02){
-  ang=*((int *)&reply[5]);
-  if (reset>0) ref_angle=ang;
-  ang=ang-ref_angle;
-  rat=*((int *)&reply[9]);    
-  
-  *(angle)=ang;
-  *(rate)=rat;
-  
-#ifdef __BT_debug
-  fprintf(stderr,"BT_read_gyro_sensor(): Command successful\n");
-  fprintf(stderr,"BT_read_gyro_sensor() response string:\n");
-  replen=reply[0]+2;
-  for(int i=0; i<13; i++)
-  {
-   fprintf(stderr,"%02X, ",reply[i]);
-  }
-  fprintf(stderr,"\n");
-  fprintf(stderr, "angle: %d, rate=%d\n", angle, rate);
-#endif
+ size_t reply_size=length_bytes[0]+256u*length_bytes[1];
+ if (reply_size!=sizeof(reply))
+ {
+  fprintf(stderr,"BT_read_gyro(): Unexpected reply size; rejecting gyro data.\n");
+  return -1;
  }
- else{
-  fprintf(stderr,"BT_read_gyro_sensor(): Command failed\n");
-  return(-1);
+ transferred=0;
+ while (transferred<sizeof(reply))
+ {
+  ssize_t count=read(*socket_id,reply+transferred,sizeof(reply)-transferred);
+  if (count<0&&errno==EINTR) continue;
+  if (count<=0) return -1;
+  transferred+=(size_t)count;
  }
- return(1);
+ if (reply[0]!=(unsigned char)message_id||reply[1]!=(unsigned char)(message_id>>8)||reply[2]!=2)
+ {
+  fprintf(stderr,"BT_read_gyro(): Invalid reply ID/status; rejecting gyro data.\n");
+  return -1;
+ }
+ int32_t raw_angle=(int32_t)((uint32_t)reply[3]|(uint32_t)reply[4]<<8|
+                            (uint32_t)reply[5]<<16|(uint32_t)reply[6]<<24);
+ int32_t raw_rate=(int32_t)((uint32_t)reply[7]|(uint32_t)reply[8]<<8|
+                           (uint32_t)reply[9]<<16|(uint32_t)reply[10]<<24);
+ // bytecodes.h defines DATA32_NAN (0x80000000) and DATA16_NAN (-32768).
+ if (raw_angle==INT32_MIN||raw_rate==INT32_MIN||raw_angle==-32768||raw_rate==-32768)
+ {
+  fprintf(stderr,"BT_read_gyro(): Sensor returned invalid angle/rate; rejecting gyro data.\n");
+  return -1;
+ }
+ int64_t reference=reset ? raw_angle : ref_angle;
+ int64_t relative=(int64_t)raw_angle-reference;
+ if (relative<INT_MIN||relative>INT_MAX) return -1;
+ if (reset) ref_angle=(int)raw_angle;
+ *angle=(int)relative;
+ *rate=(int)raw_rate;
+ return 1;
 }
-
-
 int BT_play_sound_file(const char *path, int volume){
  ////////////////////////////////////////////////////////////////////////////////////////////////
  //
