@@ -54,6 +54,7 @@
 
 #include "EV3_Localization.h"
 #include <time.h>
+#include <limits.h>
 
 extern int *socket_id;
 static int verify_nxt_colour_sensor(void);
@@ -69,6 +70,9 @@ static int continuous_black_sweep(int *readings,int sample_count,int *final_angl
 static int continuous_recovery_sweep(void);
 static MoveResult turn_in_place_alignment(int angle_degrees,int turn_direction,int timeout_ms);
 static int next_follow_alignment_colour=1;
+static int street_follow_power=10;
+static int street_test_main(int argc,char **argv);
+static int geometry_check_main(int argc,char **argv);
 
 #define SENSOR_TO_AXLE_OFFSET_REV 0.27
 #define ALIGNMENT_AXIS_ADVANCE_REV SENSOR_TO_AXLE_OFFSET_REV
@@ -87,6 +91,7 @@ static int next_follow_alignment_colour=1;
 #define FIND_STREET_TIMEOUT_MS 22000
 #define ALIGNMENT_TURN_OVERSHOOT_DEGREES 0
 #define COLOUR_CLASSIFICATION_MAX_DISTANCE_RATIO 0.85
+#define MAX_RELOCALIZATIONS 2
 
 int map[400][4];
 int sx,sy;
@@ -101,15 +106,34 @@ int main(int argc,char *argv[])
  sx=0;
  sy=0;
 
+ if (argc>1 && strcmp(argv[1],"--test-street")==0) return street_test_main(argc,argv);
+ if (argc>1 && strcmp(argv[1],"--check-geometry")==0) return geometry_check_main(argc,argv);
+
  if (argc<4)
  {
   fprintf(stderr,"Usage: EV3_Localization map_name dest_x dest_y calibration_directory [--read-colours]\n");
   fprintf(stderr,"Use -1 -1 for calibration; --read-colours monitors the NXT sensor without movement.\n");
+  fprintf(stderr,"Diagnostics: --test-street calibration_directory [power] or --check-geometry sensor_offset_mm wheel_diameter_mm\n");
   return 1;
  }
  snprintf(mapname,sizeof(mapname),"%s",argv[1]);
- dest_x=atoi(argv[2]);
- dest_y=atoi(argv[3]);
+ char *end;
+ errno=0;
+ long coordinate=strtol(argv[2],&end,10);
+ if (errno!=0||end==argv[2]||*end!='\0'||coordinate<INT_MIN||coordinate>INT_MAX)
+ {
+  fprintf(stderr,"Destination x must be an integer.\n");
+  return 1;
+ }
+ dest_x=(int)coordinate;
+ errno=0;
+ coordinate=strtol(argv[3],&end,10);
+ if (errno!=0||end==argv[3]||*end!='\0'||coordinate<INT_MIN||coordinate>INT_MAX)
+ {
+  fprintf(stderr,"Destination y must be an integer.\n");
+  return 1;
+ }
+ dest_y=(int)coordinate;
 
  if (dest_x==-1&&dest_y==-1)
  {
@@ -133,6 +157,12 @@ int main(int argc,char *argv[])
  if (parse_map(map_image,rx,ry)==0)
  {
   fprintf(stderr,"Unable to parse map image.\n");
+  free(map_image);
+  return 1;
+ }
+ if (sx<=0||sy<=0||sx>400/sy||dest_x<0||dest_x>=sx||dest_y<0||dest_y>=sy)
+ {
+  fprintf(stderr,"Destination must be within the map: x=0..%d, y=0..%d.\n",sx-1,sy-1);
   free(map_image);
   return 1;
  }
@@ -164,17 +194,16 @@ int main(int argc,char *argv[])
   }
  }
 
- for (int index=0;index<sx*sy;index++)
-  for (int heading=0;heading<4;heading++)
-   beliefs[index][heading]=1.0/(double)(sx*sy*4);
-
  fprintf(stderr,"All set, ready to go.\n");
- int robot_x=-1,robot_y=-1,direction=-1;
- int status=beep()==0&&robot_localization(&robot_x,&robot_y,&direction);
- if (status) printf("Exploration skeleton ended; location estimate remains unknown.\n");
- beep();
- usleep(150000);
- beep();
+ int status=beep()==0&&run_mission(dest_x,dest_y,MAX_RELOCALIZATIONS);
+ if (status)
+ {
+  printf("Mission complete: arrived at (%d, %d).\n",dest_x,dest_y);
+  beep();
+  usleep(150000);
+  beep();
+ }
+ else fprintf(stderr,"Mission stopped before arrival; localization or navigation failed.\n");
  BT_close();
  free(map_image);
  return status ? 0 : 1;
@@ -406,19 +435,28 @@ int turn_at_intersection(int turn_direction)
   return recovered==1||recovered==4;
   }
 
-  int find_street(void)
+  // Initial street acquisition may turn at red. Boundary recovery has already
+  // turned 180 degrees and must not trigger another untracked turnaround.
+  static int find_street_internal(int allow_red_turnaround)
   {
    const int stop_colours[]={1,4,5};
    MoveResult result=move_forward_until(stop_colours,3,FIND_STREET_MAX_REV,FIND_STREET_TIMEOUT_MS);
    report_move_result("find street",result);
    if (is_street_marker(result)) return 1;
-   if (result.reason==STOP_COLOUR&&result.colour==5) return turn_at_red_and_search(stop_colours);
+   if (result.reason==STOP_COLOUR&&result.colour==5)
+    return allow_red_turnaround ? turn_at_red_and_search(stop_colours) : 0;
   if (result.reason!=STOP_DISTANCE&&result.reason!=STOP_TIMEOUT) return 0;
    fprintf(stderr,"No road or intersection found within the bounded search.\n");
   int recovered=continuous_recovery_sweep();
   if (recovered==1||recovered==4) return 1;
-  if (recovered==5) return turn_at_red_and_search(stop_colours);
+  if (recovered==5)
+   return allow_red_turnaround ? turn_at_red_and_search(stop_colours) : 0;
   return 0;
+  }
+
+  int find_street(void)
+  {
+   return find_street_internal(1);
   }
 
   int drive_along_street(void)
@@ -507,18 +545,29 @@ static int recover_from_red_boundary(void)
   report_move_result("boundary turnaround",turn);
   return 0;
  }
- if (!find_street()) return 0;
+ if (!find_street_internal(0))
+ {
+  fprintf(stderr,"Street reacquisition failed after boundary turnaround; stopping without another turn.\n");
+  return 0;
+ }
  if (wiggle_to_black()) return 1;
  fprintf(stderr,"Black not found by recovery wipe; running full street alignment.\n");
  return align_to_street();
 }
 
-static int drive_to_next_intersection(int *direction)
+static int drive_to_next_intersection(int *direction,int *boundary_return)
 {
+ if (direction==NULL||boundary_return==NULL) return 0;
+ *boundary_return=0;
+ int recovered_boundary=0;
  for (int attempt=0;attempt<2;attempt++)
  {
   int status=drive_along_street();
-  if (status==1) return 1;
+  if (status==1)
+  {
+   *boundary_return=recovered_boundary;
+   return 1;
+  }
   if (status!=2)
   {
    fprintf(stderr,"Street following failed before reaching an intersection.\n");
@@ -530,6 +579,7 @@ static int drive_to_next_intersection(int *direction)
    return 0;
   }
   *direction=(*direction+2)%4;
+  recovered_boundary=1;
  }
  return 0;
 }
@@ -595,6 +645,188 @@ static int wiggle_to_black(void)
  return center_on_alignment_marker(1);
 }
 
+double score_intersection_scan(const int map_corners[4], const int observed[4], int heading)
+{
+  if (map_corners == NULL || observed == NULL || heading < 0 || heading > 3)
+  {
+    return -1.0;
+  }
+
+  double score = 1.0;
+
+  for (int corner = 0; corner < 4; corner++)
+  {
+    int measured = observed[corner];
+
+    if (measured != 2 && measured != 3 && measured != 6)
+      continue;
+    
+    int expected = map_corners[(corner + heading) % 4];
+
+    if (measured == expected)
+    {
+      score *= 0.8;
+    }
+    else
+    {
+      score *= 0.1;
+    }
+  }
+  
+  return score;
+}
+
+int update_beliefs_from_scan(const int observed[4])
+{
+  double updated[400][4];
+  double total = 0.0;
+
+  if (observed == NULL || sx <= 0 || sy <= 0 || sx > 400 / sy)
+    return 0;
+
+  for (int index = 0; index < sx * sy; index++)
+  {
+    for (int heading = 0; heading < 4; heading++)
+    {
+      double score = score_intersection_scan(map[index], observed, heading);
+      if (score < 0.0)
+        return 0;
+
+      updated[index][heading] = beliefs[index][heading] * score;
+      total += updated[index][heading];
+    }
+  }
+
+  if (!isfinite(total) || total <= 0.0)
+    return 0;
+
+  // Mix in a small uniform distribution so zero-weight states can recover.
+  const double recovery_weight = 1e-6;
+  double uniform = 1.0 / (sx * sy * 4);
+
+  for (int index = 0; index < sx * sy; index++)
+  {
+    for (int heading = 0; heading < 4; heading++)
+    {
+      double normalized = updated[index][heading] / total;
+      beliefs[index][heading] =
+          (1.0 - recovery_weight) * normalized + recovery_weight * uniform;
+    }
+  }
+
+  return 1;
+}
+
+int update_beliefs_after_turn(int turn_direction)
+{
+  if ((turn_direction != 0 && turn_direction != 1) ||
+      sx <= 0 || sy <= 0 || sx > 400 / sy)
+    return 0;
+
+  double updated[400][4] = {{0.0}};
+  double total = 0.0;
+  int shift = turn_direction == 0 ? 1 : 3;
+
+  for (int index = 0; index < sx * sy; index++)
+  {
+    for (int heading = 0; heading < 4; heading++)
+    {
+      int intended = (heading + shift) % 4;
+      double probability = beliefs[index][heading];
+
+      // Initial assumptions: intended turn, no turn, or a half turn.
+      // These discrete heading probabilities need validation on the robot.
+      updated[index][intended] += 0.96 * probability;
+      updated[index][heading] += 0.02 * probability;
+      updated[index][(heading + 2) % 4] += 0.02 * probability;
+    }
+  }
+
+  for (int index = 0; index < sx * sy; index++)
+    for (int heading = 0; heading < 4; heading++)
+      total += updated[index][heading];
+
+  if (!isfinite(total) || total <= 0.0)
+    return 0;
+
+  const double recovery_weight = 1e-6;
+  double uniform = 1.0 / (sx * sy * 4);
+
+  for (int index = 0; index < sx * sy; index++)
+  {
+    for (int heading = 0; heading < 4; heading++)
+    {
+      beliefs[index][heading] =
+          (1.0 - recovery_weight) * updated[index][heading] / total
+          + recovery_weight * uniform;
+    }
+  }
+
+  return 1;
+}
+
+int update_beliefs_after_forward(int boundary_return)
+{
+  if ((boundary_return != 0 && boundary_return != 1) ||
+      sx <= 0 || sy <= 0 || sx > 400 / sy)
+    return 0;
+
+  const int dx[4] = {0, 1, 0, -1};
+  const int dy[4] = {-1, 0, 1, 0};
+  double updated[400][4] = {{0.0}};
+  double total = 0.0;
+
+  for (int index = 0; index < sx * sy; index++)
+  {
+    for (int heading = 0; heading < 4; heading++)
+    {
+      int next_x = index % sx + dx[heading];
+      int next_y = index / sx + dy[heading];
+      int outside = next_x < 0 || next_x >= sx || next_y < 0 || next_y >= sy;
+      double probability = beliefs[index][heading];
+
+      // Condition on the completed trip's red/yellow outcome. Outward-facing
+      // edge states cannot explain a direct yellow arrival, and interior states
+      // cannot explain red followed by a return to the same intersection.
+      if (boundary_return)
+      {
+        if (!outside) continue;
+        // Initial turnaround model: reversed heading, or a quarter-turn error.
+        updated[index][(heading + 2) % 4] += 0.96 * probability;
+        updated[index][(heading + 1) % 4] += 0.02 * probability;
+        updated[index][(heading + 3) % 4] += 0.02 * probability;
+      }
+      else
+      {
+        if (outside) continue; // Never wrap across a map edge.
+        int next_index = next_y * sx + next_x;
+        // Initial model: one cell forward, or a false arrival/no advance.
+        updated[next_index][heading] += 0.94 * probability;
+        updated[index][heading] += 0.06 * probability;
+      }
+    }
+  }
+
+  for (int index = 0; index < sx * sy; index++)
+    for (int heading = 0; heading < 4; heading++)
+      total += updated[index][heading];
+
+  // Leave existing beliefs intact if no state can explain this outcome.
+  if (!isfinite(total) || total <= 0.0)
+    return 0;
+
+  const double recovery_weight = 1e-6;
+  double uniform = 1.0 / (sx * sy * 4);
+  for (int index = 0; index < sx * sy; index++)
+  {
+    for (int heading = 0; heading < 4; heading++)
+      beliefs[index][heading] =
+          (1.0 - recovery_weight) * updated[index][heading] / total
+          + recovery_weight * uniform;
+  }
+  return 1;
+}
+
 int robot_localization(int *robot_x, int *robot_y, int *direction)
 {
  /*  This function implements the main robot localization process. You have to write all code that will control the robot
@@ -655,62 +887,274 @@ int robot_localization(int *robot_x, int *robot_y, int *direction)
 
  if (!find_street()||!align_to_street()) return 0;
  *direction=0;
- if (!drive_to_next_intersection(direction)) return 0;
+ int boundary_return=0;
+ if (!drive_to_next_intersection(direction,&boundary_return)) return 0;
  printf("First yellow intersection establishes relative orientation 0.\n");
 
- for (int intersection=0;intersection<4;intersection++)
+ const int max_scans=24;
+ const double minimum_ratio=10.0;
+ int expected_index=-1,expected_heading=-1;
+ const int dx[4]={0,1,0,-1},dy[4]={-1,0,1,0};
+ for (int intersection=0;intersection<max_scans;intersection++)
  {
   int tl=-1,tr=-1,br=-1,bl=-1;
-  if (!scan_intersection(&tl,&tr,&br,&bl))
-   fprintf(stderr,"Intersection %d scan failed; readings are unknown, continuing route for now.\n",
+  int complete_scan=scan_intersection(&tl,&tr,&br,&bl);
+  if (!complete_scan)
+   fprintf(stderr,"Intersection %d scan incomplete; using available corner readings.\n",
      intersection+1);
   printf("Intersection %d relative readings: TL=%s TR=%s BL=%s BR=%s\n",
     intersection+1,get_colour_name(tl),get_colour_name(tr),
     get_colour_name(bl),get_colour_name(br));
 
-  if (intersection==3) break;
+  int observed[4]={tl,tr,br,bl};
+  if (!update_beliefs_from_scan(observed))
+  {
+   fprintf(stderr,"Belief update failed.\n");
+   return 0;
+  }
 
-  int turn_direction=intersection==0 ? 0 : intersection==1 ? 1 : -1;
-  if (turn_direction==0) printf("Route step: turn right at intersection 1.\n");
-  else if (turn_direction==1) printf("Route step: turn left at intersection 2.\n");
-  else printf("Route step: continue straight at intersection 3.\n");
+  int best_index=0,best_heading=0;
+  double best_probability=-1.0,second_probability=0.0,total=0.0;
+  for (int index=0;index<sx*sy;index++)
+  {
+   for (int heading=0;heading<4;heading++)
+   {
+    double probability=beliefs[index][heading];
+    total+=probability;
+    if (probability>best_probability)
+    {
+     second_probability=best_probability<0.0 ? 0.0 : best_probability;
+     best_probability=probability;
+     best_index=index;
+     best_heading=heading;
+    }
+    else if (probability>second_probability) second_probability=probability;
+   }
+  }
+
+  printf("Best candidate: (%d, %d), heading %d, probability %.6f\n",
+    best_index%sx,best_index/sx,best_heading,best_probability);
+  printf("Total belief: %.12f\n",total);
+  double ratio=second_probability>0.0 ? best_probability/second_probability : HUGE_VAL;
+  printf("Runner-up: %.6f; best/runner-up ratio: %.2f\n",second_probability,ratio);
+
+  int valid_corners=0;
+  for (int corner=0;corner<4;corner++)
+   if (observed[corner]==2||observed[corner]==3||observed[corner]==6) valid_corners++;
+  int confident=complete_scan&&valid_corners==4&&best_probability>0.0&&ratio>=minimum_ratio;
+  // Confirm the previous leading pose after accounting for the completed motion.
+  // No minimum absolute belief is required; ties and incomplete scans cannot confirm.
+  if (confident&&best_index==expected_index&&best_heading==expected_heading)
+  {
+   *robot_x=best_index%sx;
+   *robot_y=best_index/sx;
+   *direction=best_heading;
+   printf("Relative confidence confirmed on consecutive scans.\n");
+   return 1;
+  }
+  expected_index=confident ? best_index : -1;
+  expected_heading=confident ? best_heading : -1;
+
+  if (intersection+1==max_scans) break;
+
+  int route_step=intersection%3;
+  int turn_direction=route_step==0 ? 0 : route_step==1 ? 1 : -1;
+  if (turn_direction==0) printf("Route step: turn right.\n");
+  else if (turn_direction==1) printf("Route step: turn left.\n");
+  else printf("Route step: continue straight.\n");
 
   if (turn_direction>=0)
   {
    if (!turn_at_intersection(turn_direction)) return 0;
+   if (!update_beliefs_after_turn(turn_direction))
+   {
+    fprintf(stderr,"Turn belief update failed.\n");
+    return 0;
+   }
    *direction=(*direction+(turn_direction==0 ? 1 : 3))%4;
+   if (expected_index>=0)
+    expected_heading=(expected_heading+(turn_direction==0 ? 1 : 3))%4;
   }
-  if (!drive_to_next_intersection(direction)) return 0;
+  if (!drive_to_next_intersection(direction,&boundary_return)) return 0;
+  if (!update_beliefs_after_forward(boundary_return))
+  {
+   fprintf(stderr,"Forward belief update failed.\n");
+   return 0;
+  }
+  if (expected_index>=0)
+  {
+   int x=expected_index%sx+dx[expected_heading];
+   int y=expected_index/sx+dy[expected_heading];
+   int outside=x<0||x>=sx||y<0||y>=sy;
+   if (boundary_return&&outside) expected_heading=(expected_heading+2)%4;
+   else if (!boundary_return&&!outside) expected_index=y*sx+x;
+   else expected_index=-1; // The observed trip contradicts this candidate.
+  }
  }
 
- printf("Visited four intersections: right, left, straight; stopping at intersection 4.\n");
- printf("Bayesian localization is not implemented yet.\n");
- return 1;
+ fprintf(stderr,"Localization did not achieve a consistent %.0fx lead within %d scans.\n",
+         minimum_ratio,max_scans);
+ return 0;
+}
+
+// Choose a Manhattan route: horizontal first, then vertical.
+// Caller must validate coordinates against sx/sy. -1 means already at target.
+int heading_toward_target(int x, int y, int target_x, int target_y)
+{
+ if (target_x>x) return 1;
+ if (target_x<x) return 3;
+ if (target_y>y) return 2;
+ if (target_y<y) return 0;
+ return -1;
+}
+
+NavigationStepResult navigate_one_step(int *robot_x, int *robot_y, int *direction,
+                                      int target_x, int target_y)
+{
+ if (robot_x==NULL||robot_y==NULL||direction==NULL||
+     robot_x==robot_y||robot_x==direction||robot_y==direction||
+     sx<=0||sy<=0||sx>400/sy||
+     *robot_x<0||*robot_x>=sx||*robot_y<0||*robot_y>=sy||
+     *direction<0||*direction>3||
+     target_x<0||target_x>=sx||target_y<0||target_y>=sy)
+ {
+  fprintf(stderr,"Invalid navigation pose or destination.\n");
+  return NAV_STEP_ERROR;
+ }
+
+ int desired=heading_toward_target(*robot_x,*robot_y,target_x,target_y);
+ if (desired<0) return NAV_STEP_ARRIVED;
+ int turn=(desired-*direction+4)%4;
+ const int dx[4]={0,1,0,-1},dy[4]={-1,0,1,0};
+ int next_x=*robot_x+dx[desired],next_y=*robot_y+dy[desired];
+ // Check the planned edge before issuing any motor commands.
+ if (next_x<0||next_x>=sx||next_y<0||next_y>=sy) return NAV_STEP_ERROR;
+
+ if (turn==1||turn==3)
+ {
+  if (!turn_at_intersection(turn==1 ? 0 : 1)) goto navigation_lost;
+ }
+ else if (turn==2)
+ {
+  MoveResult result=turn_in_place(180,0,15000);
+  if (result.reason!=STOP_ANGLE)
+  {
+   report_move_result("navigation turnaround",result);
+   goto navigation_lost;
+  }
+ }
+ *direction=desired;
+
+ // Use the direct street follower: unexpected red must not trigger exploration's
+ // boundary turnaround or be counted as arrival at the planned intersection.
+ if (drive_along_street()!=1) goto navigation_lost;
+
+ *robot_x=next_x;
+ *robot_y=next_y;
+ printf("Navigation reached (%d, %d), heading %d.\n",next_x,next_y,desired);
+ return next_x==target_x&&next_y==target_y ? NAV_STEP_ARRIVED : NAV_STEP_MOVED;
+
+navigation_lost:
+ // A failed turn or trip can leave the robot between discrete map states.
+ *robot_x=-1;
+ *robot_y=-1;
+ *direction=-1;
+ fprintf(stderr,"Navigation stopped; pose uncertain, relocalization required.\n");
+ if (BT_motor_port_stop(MOTOR_B|MOTOR_C,1)!=0) return NAV_STEP_ERROR;
+ return NAV_STEP_LOST;
+}
+
+static NavigationStepResult navigate_to_target(int robot_x, int robot_y, int direction,
+                                                int target_x, int target_y)
+{
+ // Preserve LOST vs ERROR so the mission retries only recoverable navigation loss.
+ if (sx<=0||sy<=0||sx>400/sy||
+     robot_x<0||robot_x>=sx||robot_y<0||robot_y>=sy||direction<0||direction>3||
+     target_x<0||target_x>=sx||target_y<0||target_y>=sy)
+ {
+  fprintf(stderr,"Invalid navigation pose or destination.\n");
+  return NAV_STEP_ERROR;
+ }
+
+ // Every traversal must reduce the Manhattan distance by one. Bound the loop
+ // by that initial distance; an already-reached target requires no movement.
+ int max_steps=abs(target_x-robot_x)+abs(target_y-robot_y);
+ int steps=0;
+ do
+ {
+  NavigationStepResult result=navigate_one_step(&robot_x,&robot_y,&direction,target_x,target_y);
+  if (result==NAV_STEP_ARRIVED) return NAV_STEP_ARRIVED;
+  if (result!=NAV_STEP_MOVED)
+  {
+   fprintf(stderr,"Navigation interrupted.\n");
+   return result;
+  }
+  steps++;
+ } while (steps<max_steps);
+
+ fprintf(stderr,"Navigation exceeded the planned route length.\n");
+ return NAV_STEP_ERROR;
 }
 
 int go_to_target(int robot_x, int robot_y, int direction, int target_x, int target_y)
 {
- /*
-  * This function is called once localization has been successful, it performs the actions required to take the robot
-  * from its current location to the specified target location. 
-  *
-  * You have to write the code required to carry out this task - once again, you can use the function headers provided, or
-  * write your own code to control the bot, but document your process carefully in the comments below so your TA can easily
-  * understand how everything works.
-  *
-  * Your code should be able to determine if the robot has gotten lost (or if localization was incorrect), and your bot
-  * should be able to recover.
-  * 
-  * Inputs - The robot's current location x,y (the intersection coordinates, not image pixel coordinates)
-  *          The target's intersection location
-  * 
-  * Return values: 1 if successful (the bot reached its target destination), 0 otherwise
-  */   
+ // Keep the existing public 1=arrived, 0=failed contract.
+ return navigate_to_target(robot_x,robot_y,direction,target_x,target_y)==NAV_STEP_ARRIVED;
+}
 
-  /************************************************************************************************************************
-   *   TO DO  -   Complete this function
-   ***********************************************************************************************************************/
-  return(0);  
+int run_mission(int target_x, int target_y, int max_relocalizations)
+{
+ if (sx<=0||sy<=0||sx>400/sy||target_x<0||target_x>=sx||
+     target_y<0||target_y>=sy||max_relocalizations<0)
+ {
+  fprintf(stderr,"Invalid mission destination, map size, or retry limit.\n");
+  return 0;
+ }
+ if (BT_motor_port_stop(MOTOR_B|MOTOR_C,1)!=0)
+ {
+  fprintf(stderr,"Unable to brake before localization; mission stopped.\n");
+  return 0;
+ }
+
+ int retries_left=max_relocalizations;
+ for (;;)
+ {
+  // A lost pose invalidates the entire old distribution, including its heading.
+  // Also discard colour confirmations and the previous street-alignment marker.
+  for (int index=0;index<sx*sy;index++)
+   for (int heading=0;heading<4;heading++)
+    beliefs[index][heading]=1.0/(double)(sx*sy*4);
+  reset_sensor_color_filter();
+  next_follow_alignment_colour=1;
+  int robot_x=-1,robot_y=-1,direction=-1;
+  if (robot_localization(&robot_x,&robot_y,&direction))
+  {
+   printf("Localized at (%d, %d), heading %d; navigating to (%d, %d).\n",
+          robot_x,robot_y,direction,target_x,target_y);
+   NavigationStepResult result=navigate_to_target(robot_x,robot_y,direction,target_x,target_y);
+   if (result==NAV_STEP_ARRIVED) return 1;
+   if (result==NAV_STEP_ERROR)
+   {
+    fprintf(stderr,"Navigation error; automatic retry disabled for this failure.\n");
+    return 0;
+   }
+  }
+  else fprintf(stderr,"Localization attempt failed.\n");
+
+  // Confirm braking before another search, and also on the final failed attempt.
+  if (BT_motor_port_stop(MOTOR_B|MOTOR_C,1)!=0)
+  {
+   fprintf(stderr,"Unable to brake after pose loss; mission stopped.\n");
+   return 0;
+  }
+  if (retries_left==0)
+  {
+   fprintf(stderr,"Relocalization retry limit reached; mission stopped.\n");
+   return 0;
+  }
+  retries_left--;
+  printf("Restarting localization with uniform beliefs; %d further retries available.\n",retries_left);
+ }
 }
 
 static int calibration_command(const unsigned char *operations, size_t operation_size,
@@ -1641,8 +2085,8 @@ static int follow_black_street(void)
 {
  const double max_forward_revolutions=2;
  const int timeout_ms=60000;
- const int follow_power=10;
- const int steering_correction_limit=4;
+ const int follow_power=street_follow_power;
+ const int steering_correction_limit=follow_power<8 ? follow_power/2 : 4;
  int angle,rate,right_previous,left_previous;
  int alignment_colour=next_follow_alignment_colour;
  next_follow_alignment_colour=1;
@@ -1742,291 +2186,334 @@ static int follow_black_street(void)
  }
 }
 
+// One-segment diagnostics use the real street follower, with no exploration or
+// boundary turnaround. Yellow is a sensor outcome; the operator must verify
+// it is the intended next intersection rather than the starting intersection.
+static int run_street_segment_test(void)
+{
+ if (BT_motor_port_stop(MOTOR_B|MOTOR_C,1)!=0) return 0;
+ int angle,rate,minimum=INT_MAX,maximum=INT_MIN;
+ for (int sample=0;sample<5;sample++)
+ {
+  if (BT_read_gyro(GYRO_SENSOR_PORT,0,&angle,&rate)!=1) return 0;
+  if (angle<minimum) minimum=angle;
+  if (angle>maximum) maximum=angle;
+  if (sample<4) usleep(200000);
+ }
+ printf("Stationary gyro spread: %lld degrees.\n",(long long)maximum-minimum);
+ if ((long long)maximum-minimum>2)
+ {
+  fprintf(stderr,"STREET_RESULT,gyro_unstable\n");
+  return 0;
+ }
+ int initial_colour=sample_alignment_colour();
+ if (initial_colour!=1)
+ {
+  fprintf(stderr,"STREET_RESULT,invalid_start\nStart on black just beyond yellow; saw %s.\n",get_colour_name(initial_colour));
+  return 0;
+ }
+ int right0,left0,right1,left1;
+ if (read_wheel_degrees(&right0,&left0)!=0) return 0;
+ printf("Street test: power %d; sensor offset %.6f wheel revolutions (configured, not measured).\n",
+        street_follow_power,(double)SENSOR_TO_AXLE_OFFSET_REV);
+ fflush(stdout);
+ struct timespec start;
+ clock_gettime(CLOCK_MONOTONIC,&start);
+ int result=follow_black_street();
+ long duration=elapsed_ms(&start);
+ int brake_ok=BT_motor_port_stop(MOTOR_B|MOTOR_C,1)==0;
+ int encoders_ok=read_wheel_degrees(&right1,&left1)==0;
+ int final_colour=brake_ok ? sample_alignment_colour() : -1;
+ if (encoders_ok)
+  printf("STREET_ENCODERS,%lld,%lld\n",(long long)right1-right0,(long long)left1-left0);
+ printf("Wheel deltas include initial centering and recovery turns; they are not straight-line distance.\n");
+ printf("STREET_DURATION_MS,%ld\n",duration);
+ const char *outcome=!brake_ok ? "brake_failed" : !encoders_ok ? "encoder_error" :
+   result==2 ? "red_border" : result==1&&final_colour==4 ? "yellow_detected" :
+   result==1 ? "yellow_unverified" : "following_failed";
+ printf("STREET_RESULT,%s\n",outcome);
+ fflush(stdout);
+ return brake_ok&&encoders_ok&&result==1&&final_colour==4;
+}
+
+static int street_test_main(int argc,char **argv)
+{
+ if (argc!=3&&argc!=4)
+ {
+  fprintf(stderr,"Usage: EV3_Localization --test-street calibration_directory [power 1..20]\n");
+  return 1;
+ }
+ if (argc==4)
+ {
+  char *end;
+  errno=0;
+  long power=strtol(argv[3],&end,10);
+  if (errno||end==argv[3]||*end||power<1||power>20) return 1;
+  street_follow_power=(int)power;
+ }
+ if (load_colour_calibration(argv[2])!=0)
+ {
+  fprintf(stderr,"Invalid calibration directory.\n");
+  return 1;
+ }
+ if (BT_open(HEXKEY)!=0) return 1;
+ int setup_ok=movement_setup(NULL,0)==0&&verify_nxt_colour_sensor()==0;
+ int success=setup_ok&&run_street_segment_test();
+ if (BT_motor_port_stop(MOTOR_B|MOTOR_C,1)!=0) success=0;
+ BT_close();
+ return success ? 0 : 1;
+}
+
+static int geometry_check_main(int argc,char **argv)
+{
+ if (argc!=4)
+ {
+  fprintf(stderr,"Usage: EV3_Localization --check-geometry sensor_offset_mm wheel_diameter_mm\n");
+  return 1;
+ }
+ double measurements[2];
+ for (int index=0;index<2;index++)
+ {
+  char *end;
+  errno=0;
+  measurements[index]=strtod(argv[index+2],&end);
+  if (errno||end==argv[index+2]||*end||!isfinite(measurements[index])||measurements[index]<=0.0) return 1;
+ }
+ double revolutions=measurements[0]/(acos(-1.0)*measurements[1]);
+ if (!isfinite(revolutions)||revolutions<=0.0) return 1;
+ printf("Measured sensor-to-axle advance: %.6f wheel revolutions.\n",revolutions);
+ printf("Configured SENSOR_TO_AXLE_OFFSET_REV: %.6f.\n",(double)SENSOR_TO_AXLE_OFFSET_REV);
+ printf("Calculation only: no connection, motion, or configuration change.\n");
+ return 0;
+}
+
+// Map/PPM parsing is independent of robot control. All pixel offsets use size_t.
+static int map_pixel_is_yellow(const unsigned char *image,int width,int x,int y)
+{
+ const unsigned char *pixel=image+((size_t)y*(size_t)width+(size_t)x)*3;
+ return pixel[0]==255&&pixel[1]==255&&pixel[2]==0;
+}
+
+static int map_axis_intersections(const unsigned char *image,int rx,int ry,int fixed,
+                                  int horizontal,int starts[400],int sizes[400],int *count)
+{
+ int limit=horizontal ? rx : ry;
+ int position=0;
+ *count=0;
+ while (position<limit)
+ {
+  if (!map_pixel_is_yellow(image,rx,horizontal ? position : fixed,horizontal ? fixed : position))
+  {position++;continue;}
+  int first=position;
+  do {position++;}
+  while (position<limit&&map_pixel_is_yellow(image,rx,
+         horizontal ? position : fixed,horizontal ? fixed : position));
+  if (*count>=400) return 0;
+  starts[*count]=first;
+  sizes[*count]=position-first;
+  (*count)++;
+ }
+ return *count>0;
+}
+
 int parse_map(unsigned char *map_img, int rx, int ry)
 {
- /*
-   This function takes an input image map array, and two integers that specify the image size.
-   It attempts to parse this image into a representation of the map in the image. The size
-   and resolution of the map image should not affect the parsing (i.e. you can make your own
-   maps without worrying about the exact position of intersections, roads, buildings, etc.).
-
-   However, this function requires:
-   
-   * White background for the image  [255 255 255]
-   * Red borders around the map  [255 0 0]
-   * Black roads  [0 0 0]
-   * Yellow intersections  [255 255 0]
-   * Buildings that are pure green [0 255 0], pure blue [0 0 255], or white [255 255 255]
-   (any other colour values are ignored - so you can add markings if you like, those 
-    will not affect parsing)
-
-   The image must be a properly formated .ppm image, see readPPMimage below for details of
-   the format. The GIMP image editor saves properly formatted .ppm images, as does the
-   imagemagick image processing suite.
-   
-   The map representation is read into the map array, with each row in the array corrsponding
-   to one intersection, in raster order, that is, for a map with k intersections along its width:
-   
-    (row index for the intersection)
-    
-    0     1     2    3 ......   k-1
-    
-    k    k+1   k+2  ........    
-    
-    Each row will then contain the colour values for buildings around the intersection 
-    clockwise from top-left, that is
-    
-    
-    top-left               top-right
-            
-            intersection
-    
-    bottom-left           bottom-right
-    
-    So, for the first intersection (at row 0 in the map array)
-    map[0][0] <---- colour for the top-left building
-    map[0][1] <---- colour for the top-right building
-    map[0][2] <---- colour for the bottom-right building
-    map[0][3] <---- colour for the bottom-left building
-    
-    Color values for map locations are defined as follows (this agrees with what the
-    EV3 sensor returns in indexed-colour-reading mode):
-    
-    1 -  Black
-    2 -  Blue
-    3 -  Green
-    4 -  Yellow
-    5 -  Red
-    6 -  White
-    
-    If you find a 0, that means you're trying to access an intersection that is not on the
-    map! Also note that in practice, because of how the map is defined, you should find
-    only Green, Blue, or White around a given intersection.
-    
-    The map size (the number of intersections along the horizontal and vertical directions) is
-    updated and left in the global variables sx and sy.
-
-    Feel free to create your own maps for testing (you'll have to print them to a reasonable
-    size to use with your bot).
-    
- */    
- 
- int last3[3];
- int x,y;
- unsigned char R,G,B;
- int ix,iy;
- int bx,by,dx,dy,wx,wy;         // Intersection geometry parameters
- int tgl;
- int idx;
- 
- ix=iy=0;       // Index to identify the current intersection
- 
- // Determine the spacing and size of intersections in the map
- tgl=0;
- for (int i=0; i<rx; i++)
+ // Yellow markers must form a complete grid. Corners are sampled clockwise
+ // TL,TR,BR,BL, at the same offsets used by the assignment's original parser.
+ // Commit the map only after all geometry, capacity and colour checks pass.
+ sx=sy=0;
+ if (map_img==NULL||rx<=0||ry<=0||(size_t)ry>((size_t)-1)/3/(size_t)rx)
  {
-  for (int j=0; j<ry; j++)
-  {
-   R=*(map_img+((i+(j*rx))*3));
-   G=*(map_img+((i+(j*rx))*3)+1);
-   B=*(map_img+((i+(j*rx))*3)+2);
-   if (R==255&&G==255&&B==0)
-   {
-    // First intersection, top-left pixel. Scan right to find width and spacing
-    bx=i;           // Anchor for intersection locations
-    by=j;
-    for (int k=i; k<rx; k++)        // Find width and horizontal distance to next intersection
-    {
-     R=*(map_img+((k+(by*rx))*3));
-     struct timeval timeout={0,500000};
-     B=*(map_img+((k+(by*rx))*3)+2);
-     if (tgl==0&&(R!=255||G!=255||B!=0))
-     {
-      tgl=1;
-      wx=k-i;
-     }
-     if (tgl==1&&R==255&&G==255&&B==0)
-     {
-      tgl=2;
-      dx=k-i;
-     }
-    }
-    for (int k=j; k<ry; k++)        // Find height and vertical distance to next intersection
-    {
-     R=*(map_img+((bx+(k*rx))*3));
-     G=*(map_img+((bx+(k*rx))*3)+1);
-     B=*(map_img+((bx+(k*rx))*3)+2);
-     if (tgl==2&&(R!=255||G!=255||B!=0))
-     {
-      tgl=3;
-      wy=k-j;
-     }
-     if (tgl==3&&R==255&&G==255&&B==0)
-     {
-      tgl=4;
-      dy=k-j;
-     }
-    }
-    
-    if (tgl!=4)
-    {
-     fprintf(stderr,"Unable to determine intersection geometry!\n");
-     return(0);
-    }
-    else break;
-   }
-  }
-  if (tgl==4) break;
+  fprintf(stderr,"Invalid map image dimensions.\n");
+  return 0;
  }
-  fprintf(stderr,"Intersection parameters: base_x=%d, base_y=%d, width=%d, height=%d, horiz_distance=%d, vertical_distance=%d\n",bx,by,wx,wy,dx,dy);
+ int first_x=-1,first_y=-1;
+ for (int y=0;y<ry&&first_y<0;y++)
+  for (int x=0;x<rx;x++)
+   if (map_pixel_is_yellow(map_img,rx,x,y)) {first_x=x;first_y=y;break;}
+ if (first_y<0)
+ {
+  fprintf(stderr,"Map contains no yellow intersections.\n");
+  return 0;
+ }
 
-  sx=0;
-  for (int i=bx+(wx/2);i<rx;i+=dx)
+ int columns[400],column_widths[400],rows[400],row_heights[400],nx,ny;
+ if (!map_axis_intersections(map_img,rx,ry,first_y,1,columns,column_widths,&nx)||
+     !map_axis_intersections(map_img,rx,ry,first_x,0,rows,row_heights,&ny))
+ {
+  fprintf(stderr,"Invalid intersection sizes, spacing, or axis capacity.\n");
+  return 0;
+ }
+ if (nx>400/ny)
+ {
+  fprintf(stderr,"Map exceeds the 400-intersection capacity.\n");
+  return 0;
+ }
+
+ // The supplied map has unequal marker sizes and one-pixel edge irregularities.
+ // Require solid marker interiors and reject yellow outside a one-pixel margin
+ // around the inferred rectangles; do not require exact spacing or edge pixels.
+ int row=0;
+ for (int y=0;y<ry;y++)
+ {
+  while (row<ny&&y>rows[row]+row_heights[row]) row++;
+  int in_row=row<ny&&y>=rows[row]-1;
+  int column=0;
+  for (int x=0;x<rx;x++)
   {
-   R=*(map_img+((i+(by*rx))*3));
-   G=*(map_img+((i+(by*rx))*3)+1);
-   B=*(map_img+((i+(by*rx))*3)+2);
-   if (R==255&&G==255&&B==0) sx++;
-  }
-
-  sy=0;
-  for (int j=by+(wy/2);j<ry;j+=dy)
-  {
-   R=*(map_img+((bx+(j*rx))*3));
-   G=*(map_img+((bx+(j*rx))*3)+1);
-   B=*(map_img+((bx+(j*rx))*3)+2);
-   if (R==255&&G==255&&B==0) sy++;
-  }
-  
-  fprintf(stderr,"Map size: Number of horizontal intersections=%d, number of vertical intersections=%d\n",sx,sy);
-
-  // Scan for building colours around each intersection
-  idx=0;
-  for (int j=0; j<sy; j++)
-   for (int i=0; i<sx; i++)
+   while (column<nx&&x>columns[column]+column_widths[column]) column++;
+   int allowed=in_row&&column<nx&&x>=columns[column]-1;
+   int required=allowed&&x>=columns[column]+1&&x<columns[column]+column_widths[column]-1&&
+                y>=rows[row]+1&&y<rows[row]+row_heights[row]-1;
+   int yellow=map_pixel_is_yellow(map_img,rx,x,y);
+   if ((yellow&&!allowed)||(!yellow&&required))
    {
-    x=bx+(i*dx)+(wx/2);
-    y=by+(j*dy)+(wy/2);
-    
-    fprintf(stderr,"Intersection location: %d, %d\n",x,y);
-    // Top-left
-    x-=wx;
-    y-=wy;
-    R=*(map_img+((x+(y*rx))*3));
-    G=*(map_img+((x+(y*rx))*3)+1);
-    B=*(map_img+((x+(y*rx))*3)+2);
-    if (R==0&&G==255&&B==0) map[idx][0]=3;
-    else if (R==0&&G==0&&B==255) map[idx][0]=2;
-    else if (R==255&&G==255&&B==255) map[idx][0]=6;
-    else fprintf(stderr,"Colour is not valid for intersection %d,%d, Top-Left RGB=%d,%d,%d\n",i,j,R,G,B);
-
-    // Top-right
-    x+=2*wx;
-    R=*(map_img+((x+(y*rx))*3));
-    G=*(map_img+((x+(y*rx))*3)+1);
-    B=*(map_img+((x+(y*rx))*3)+2);
-    if (R==0&&G==255&&B==0) map[idx][1]=3;
-    else if (R==0&&G==0&&B==255) map[idx][1]=2;
-    else if (R==255&&G==255&&B==255) map[idx][1]=6;
-    else fprintf(stderr,"Colour is not valid for intersection %d,%d, Top-Right RGB=%d,%d,%d\n",i,j,R,G,B);
-
-    // Bottom-right
-    y+=2*wy;
-    R=*(map_img+((x+(y*rx))*3));
-    G=*(map_img+((x+(y*rx))*3)+1);
-    B=*(map_img+((x+(y*rx))*3)+2);
-    if (R==0&&G==255&&B==0) map[idx][2]=3;
-    else if (R==0&&G==0&&B==255) map[idx][2]=2;
-    else if (R==255&&G==255&&B==255) map[idx][2]=6;
-    else fprintf(stderr,"Colour is not valid for intersection %d,%d, Bottom-Right RGB=%d,%d,%d\n",i,j,R,G,B);
-    
-    // Bottom-left
-    x-=2*wx;
-    R=*(map_img+((x+(y*rx))*3));
-    G=*(map_img+((x+(y*rx))*3)+1);
-    B=*(map_img+((x+(y*rx))*3)+2);
-    if (R==0&&G==255&&B==0) map[idx][3]=3;
-    else if (R==0&&G==0&&B==255) map[idx][3]=2;
-    else if (R==255&&G==255&&B==255) map[idx][3]=6;
-    else fprintf(stderr,"Colour is not valid for intersection %d,%d, Bottom-Left RGB=%d,%d,%d\n",i,j,R,G,B);
-    
-    fprintf(stderr,"Colours for this intersection: %d, %d, %d, %d\n",map[idx][0],map[idx][1],map[idx][2],map[idx][3]);
-    
-    idx++;
+    fprintf(stderr,"Yellow intersections do not form a complete rectangular grid.\n");
+    return 0;
    }
+  }
+ }
 
- return(1);  
+ int parsed[400][4]={{0}};
+ const int corner_x[4]={-1,1,1,-1},corner_y[4]={-1,-1,1,1};
+ for (int y=0;y<ny;y++) for (int x=0;x<nx;x++)
+ {
+  int wx=column_widths[x],wy=row_heights[y];
+  if (!map_pixel_is_yellow(map_img,rx,columns[x]+wx/2,rows[y]+wy/2))
+  {
+   fprintf(stderr,"Missing yellow intersection at (%d,%d).\n",x,y);
+   return 0;
+  }
+  for (int corner=0;corner<4;corner++)
+  {
+   // Use wider arithmetic until bounds are checked, including huge dimensions.
+   long long px=(long long)columns[x]+wx/2+(long long)corner_x[corner]*wx;
+   long long py=(long long)rows[y]+wy/2+(long long)corner_y[corner]*wy;
+   if (px<0||px>=rx||py<0||py>=ry)
+   {
+    fprintf(stderr,"Building sample outside image at intersection (%d,%d).\n",x,y);
+    return 0;
+   }
+   const unsigned char *pixel=map_img+((size_t)py*(size_t)rx+(size_t)px)*3;
+   int colour=0;
+   if (pixel[0]==0&&pixel[1]==0&&pixel[2]==255) colour=2;
+   else if (pixel[0]==0&&pixel[1]==255&&pixel[2]==0) colour=3;
+   else if (pixel[0]==255&&pixel[1]==255&&pixel[2]==255) colour=6;
+   if (colour==0)
+   {
+    fprintf(stderr,"Invalid building colour at intersection (%d,%d), corner %d.\n",x,y,corner);
+    return 0;
+   }
+   parsed[y*nx+x][corner]=colour;
+  }
+ }
+
+ memset(map,0,sizeof(map));
+ memcpy(map,parsed,(size_t)nx*(size_t)ny*4*sizeof(int));
+ sx=nx;sy=ny;
+ fprintf(stderr,"Map size: Number of horizontal intersections=%d, number of vertical intersections=%d\n",sx,sy);
+ return 1;
+}
+
+static int ppm_header_token(FILE *input,char *token,size_t capacity,int *separator)
+{
+ int character;
+ for (;;)
+ {
+  character=fgetc(input);
+  if (character==EOF) return 0;
+  if (isspace((unsigned char)character)) continue;
+  if (character!='#') break;
+  do {character=fgetc(input);} while (character!=EOF&&character!='\n'&&character!='\r');
+ }
+ size_t length=0;
+ do
+ {
+  if (character=='\0') return 0;
+  if (length+1>=capacity) return 0;
+  token[length++]=(char)character;
+  character=fgetc(input);
+ } while (character!=EOF&&!isspace((unsigned char)character));
+ token[length]='\0';
+ *separator=character;
+ return 1;
+}
+
+static int ppm_positive_integer(const char *text,int *value)
+{
+ // Reject signs, suffixes, overflow, and empty/zero dimensions.
+ if (*text=='\0') return 0;
+ for (const char *p=text;*p;p++) if (*p<'0'||*p>'9') return 0;
+ errno=0;
+ char *end;
+ long parsed=strtol(text,&end,10);
+ if (errno!=0||*end!='\0'||parsed<1||parsed>INT_MAX) return 0;
+ *value=(int)parsed;
+ return 1;
 }
 
 unsigned char *readPPMimage(const char *filename, int *rx, int *ry)
 {
- // Reads an image from a .ppm file. A .ppm file is a very simple image representation
- // format with a text header followed by the binary RGB data at 24bits per pixel.
- // The header has the following form:
- //
- // P6
- // # One or more comment lines preceded by '#'
- // 340 200
- // 255
- //
- // The first line 'P6' is the .ppm format identifier, this is followed by one or more
- // lines with comments, typically used to inidicate which program generated the
- // .ppm file.
- // After the comments, a line with two integer values specifies the image resolution
- // as number of pixels in x and number of pixels in y.
- // The final line of the header stores the maximum value for pixels in the image,
- // usually 255.
- // After this last header line, binary data stores the RGB values for each pixel
- // in row-major order. Each pixel requires 3 bytes ordered R, G, and B.
- //
- // NOTE: Windows file handling is rather crotchetty. You may have to change the
- //       way this file is accessed if the images are being corrupted on read
- //       on Windows.
- //
-
- FILE *f;
- unsigned char *im;
- char line[1024];
- int i;
- unsigned char *tmp;
- double *fRGB;
-
- im=NULL;
- f=fopen(filename,"rb+");
- if (f==NULL)
+ // Single binary P6 image, 8-bit RGB. Header comments and CRLF are supported;
+ // after maxval, consume only the separator, never whitespace-valued pixels.
+ if (rx==NULL||ry==NULL||rx==ry) return NULL;
+ *rx=*ry=0;
+ if (filename==NULL) return NULL;
+ FILE *input=fopen(filename,"rb");
+ if (input==NULL)
  {
-  fprintf(stderr,"Unable to open file %s for reading, please check name and path\n",filename);
-  return(NULL);
+  fprintf(stderr,"Unable to open map image for reading.\n");
+  return NULL;
  }
- fgets(&line[0],1000,f);
- if (strcmp(&line[0],"P6\n")!=0)
+ char token[64];
+ int separator,width,height,maxval;
+ if (!ppm_header_token(input,token,sizeof(token),&separator)||strcmp(token,"P6")!=0||
+     !ppm_header_token(input,token,sizeof(token),&separator)||!ppm_positive_integer(token,&width)||
+     !ppm_header_token(input,token,sizeof(token),&separator)||!ppm_positive_integer(token,&height)||
+     !ppm_header_token(input,token,sizeof(token),&separator)||!ppm_positive_integer(token,&maxval)||
+     maxval!=255||separator==EOF||(size_t)height>((size_t)-1)/3/(size_t)width)
  {
-  fprintf(stderr,"Wrong file format, not a .ppm file or header end-of-line characters missing\n");
-  fclose(f);
-  return(NULL);
+  fprintf(stderr,"Invalid P6 PPM header or image dimensions.\n");
+  fclose(input);
+  return NULL;
  }
- fprintf(stderr,"%s\n",line);
- // Skip over comments
- fgets(&line[0],511,f);
- while (line[0]=='#')
+ size_t bytes=(size_t)width*(size_t)height*3;
+ // Check the actual file length before allocating from untrusted dimensions.
+ // Map files contain exactly one image; truncated or extra payload is rejected.
+ long raster_start=ftell(input);
+ int length_ok=raster_start>=0&&fseek(input,0,SEEK_END)==0;
+ long file_end=length_ok ? ftell(input) : -1;
+ // Distinguish a CRLF separator from a CR separator followed by a pixel whose
+ // first byte is LF. File length tells us whether the extra LF is header data.
+ if (length_ok&&separator=='\r'&&file_end>raster_start&&
+     (unsigned long long)(file_end-raster_start-1)==(unsigned long long)bytes)
  {
-  fprintf(stderr,"%s",line);
-  fgets(&line[0],511,f);
+  if (fseek(input,raster_start,SEEK_SET)!=0||fgetc(input)!='\n') length_ok=0;
+  else raster_start++;
  }
- sscanf(&line[0],"%d %d\n",rx,ry);                  // Read image size
- fprintf(stderr,"nx=%d, ny=%d\n\n",*rx,*ry);
-
- fgets(&line[0],9,f);  	                // Read the remaining header line
- fprintf(stderr,"%s\n",line);
- im=(unsigned char *)calloc((*rx)*(*ry)*3,sizeof(unsigned char));
- if (im==NULL)
+ if (!length_ok||file_end<raster_start||
+     (unsigned long long)(file_end-raster_start)!=(unsigned long long)bytes||
+     fseek(input,raster_start,SEEK_SET)!=0)
  {
-  fprintf(stderr,"Out of memory allocating space for image\n");
-  fclose(f);
-  return(NULL);
+  fprintf(stderr,"PPM raster length does not match its dimensions.\n");
+  fclose(input);
+  return NULL;
  }
- fread(im,(*rx)*(*ry)*3*sizeof(unsigned char),1,f);
- fclose(f);
-
- return(im);    
+ unsigned char *image=(unsigned char *)malloc(bytes);
+ if (image==NULL)
+ {
+  fprintf(stderr,"Unable to allocate map image.\n");
+  fclose(input);
+  return NULL;
+ }
+ int read_ok=fread(image,1,bytes,input)==bytes&&!ferror(input);
+ int close_ok=fclose(input)==0;
+ if (!read_ok||!close_ok)
+ {
+  fprintf(stderr,"Unable to read complete PPM raster.\n");
+  free(image);
+  return NULL;
+ }
+ *rx=width;*ry=height;
+ return image;
 }

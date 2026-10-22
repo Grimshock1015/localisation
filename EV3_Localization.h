@@ -69,12 +69,23 @@ code that you have to complete in order to implement the localization algorithms
 #include "./EV3_RobotControl/btcomm.h"
 
 #ifndef HEXKEY
-	#define HEXKEY "00:16:53:56:55:D9"	// <--- SET UP YOUR EV3's HEX ID here
+	#define HEXKEY "00:16:53:55:D9:FC"	// R2D2 EV3 Bluetooth address
 #endif
 
 int parse_map(unsigned char *map_img, int rx, int ry);
 int robot_localization(int *robot_x, int *robot_y, int *direction);
 int go_to_target(int robot_x, int robot_y, int direction, int target_x, int target_y);
+// Run localization/navigation with at most max_relocalizations recovery retries.
+// Beliefs and sensor history are reset for every localization attempt.
+int run_mission(int target_x, int target_y, int max_relocalizations);
+int heading_toward_target(int x, int y, int target_x, int target_y);
+typedef enum {
+ NAV_STEP_ERROR=-1, NAV_STEP_LOST=0, NAV_STEP_MOVED=1, NAV_STEP_ARRIVED=2
+} NavigationStepResult;
+// Perform at most one street traversal. Invalid inputs return ERROR unchanged.
+// LOST invalidates the pose (-1,-1,-1); the caller must relocalize before retrying.
+NavigationStepResult navigate_one_step(int *robot_x, int *robot_y, int *direction,
+                                      int target_x, int target_y);
 int find_street(void);
 int drive_along_street(void);
 int scan_intersection(int *tl, int *tr, int *br, int *bl);
@@ -109,5 +120,13 @@ MoveResult turn_in_place_until(int angle_degrees, int turn_direction, const int 
 int report_move_result(const char *label, MoveResult result);
 int beep(void);
 unsigned char *readPPMimage(const char *filename, int *rx, int*ry);
+
+double score_intersection_scan(const int map_corners[4], const int observed[4], int heading);
+int update_beliefs_from_scan(const int observed[4]);
+int update_beliefs_after_turn(int turn_direction);
+// After a completed intersection-to-intersection trip: 0=direct yellow,
+// 1=red boundary turnaround and return to the starting intersection.
+int update_beliefs_after_forward(int boundary_return);
+
 
 #endif
